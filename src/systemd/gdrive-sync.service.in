@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync your starred Google Drive folders (gdrive-sync)
+
+[Service]
+Type=simple
+ExecStart="@BIN@" daemon
+Environment=PYTHONUNBUFFERED=1
+# Only the daemon gets SIGTERM; it asks rclone to stop gracefully so no sync is left half-done.
+KillMode=mixed
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

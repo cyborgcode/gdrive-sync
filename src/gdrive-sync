@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""gdrive-sync: keep your starred Google Drive folders on this computer, synced both ways."""
+
+import configparser
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from collections import deque
+from datetime import datetime
+
+VERSION = "1.1.0"
+# Bump whenever EXCLUDES changes: bisync needs a --resync after a filter change.
+FILTER_VERSION = 2
+MARKER = ".gdrive-sync-folder-id"
+EXCLUDES = [
+    "/" + MARKER,
+    ".~lock.*#",
+    "~$*",
+    ".goutputstream-*",
+    "*.part",
+    "*.partial",
+    "*.crdownload",
+    "*.swp",
+    ".Trash-*/**",
+]
+FOLDER_MIME = "application/vnd.google-apps.folder"
+# Only folders you own: folders shared with you are never synced.
+STARRED_QUERY = ("starred = true and mimeType = '%s' and trashed = false and 'me' in owners"
+                 % FOLDER_MIME)
+ACTIVITY_LIMIT = 40
+RETIRE_AFTER_MISSES = 2
+NESTED_RECHECK_SECONDS = 6 * 3600
+STATUS_HEARTBEAT_SECONDS = 5
+NETWORK_HINTS = (
+    "dial tcp", "no such host", "network is unreachable", "connection refused",
+    "i/o timeout", "tls handshake timeout", "connection reset", "server misbehaving",
+    "temporary failure in name resolution", "context deadline exceeded", "no route to host",
+)
+AUTH_HINTS = ("invalid_client", "invalid_grant", "unauthorized_client", "oauth2: cannot fetch token",
+              "couldn't fetch token", "token expired")
+CLIENT_ID_WARNING = ("This Google Drive connection uses rclone's shared client ID, which Google is "
+                     "retiring. Run the installer again to add your own client ID.")
+
+
+class Paths:
+    def __init__(self, env=None):
+        env = os.environ if env is None else env
+        home = env.get("HOME") or os.path.expanduser("~")
+        config_home = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        state_home = env.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        self.data_home = env.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
+        runtime = env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+        self.config_file = os.path.join(config_home, "gdrive-sync", "config.ini")
+        self.state_dir = os.path.join(state_home, "gdrive-sync")
+        self.state_file = os.path.join(self.state_dir, "state.json")
+        self.lock_file = os.path.join(self.state_dir, "daemon.lock")
+        self.runtime_dir = os.path.join(runtime, "gdrive-sync")
+        self.status_file = os.path.join(self.runtime_dir, "status.json")
+        self.request_dir = os.path.join(self.runtime_dir, "requests")
+
+    def folder_dir(self, folder_id):
+        return os.path.join(self.state_dir, "folders", folder_id)
+
+
+class Config:
+    def __init__(self, paths):
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(paths.config_file)
+        section = parser["gdrive-sync"] if parser.has_section("gdrive-sync") else {}
+
+        def path_option(key, default):
+            value = section.get(key, default).strip() or default
+            return os.path.abspath(os.path.expanduser(value))
+
+        self.remote = section.get("remote", "gdrive").strip()
+        if not self.remote or any(c in self.remote for c in ",:"):
+            raise SystemExit("config: invalid remote name %r" % self.remote)
+        self.folder = path_option("folder", "~/GoogleDrive")
+        self.rclone = path_option("rclone", os.path.join(paths.data_home, "gdrive-sync", "rclone"))
+        try:
+            self.interval = max(1, int(section.get("interval_minutes", "5"))) * 60
+        except ValueError:
+            self.interval = 300
+
+    def remote_spec(self, folder_id):
+        return "%s,root_folder_id=%s:" % (self.remote, folder_id)
+
+
+# ---------------------------------------------------------------- pure helpers
+
+def write_json_atomic(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def local_name(drive_name):
+    name = "".join(" " if ord(c) < 32 or c == "\x7f" else c for c in drive_name)
+    name = name.replace("/", "／").strip()
+    while len(name.encode("utf-8")) > 200:
+        name = name[:-1]
+    name = name.strip()
+    if name in ("", ".", ".."):
+        name = "Untitled folder"
+    return name
+
+
+def is_excluded(rel):
+    parts = rel.split("/")
+    if rel == MARKER:
+        return True
+    if any(fnmatch.fnmatchcase(p, ".Trash-*") for p in parts[:-1]):
+        return True
+    base = parts[-1]
+    return any(fnmatch.fnmatchcase(base, pattern)
+               for pattern in EXCLUDES if "/" not in pattern)
+
+
+def tree_signature(roots):
+    digest = hashlib.blake2b(digest_size=16)
+    count = 0
+    for root in roots:
+        digest.update(root.encode("utf-8", "surrogateescape") + b"\0")
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            dirnames[:] = [d for d in dirnames if not fnmatch.fnmatchcase(d, ".Trash-*")]
+            for name in sorted(filenames) + ["/" + d for d in dirnames]:
+                path = os.path.join(dirpath, name.lstrip("/"))
+                rel = os.path.relpath(path, root)
+                if is_excluded(rel):
+                    continue
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                count += 1
+                digest.update(("%s\0%d\0%d\0" % (name, st.st_size, st.st_mtime_ns))
+                              .encode("utf-8", "surrogateescape"))
+    return digest.hexdigest(), count
+
+
+def classify(errors):
+    text = "\n".join(errors).lower()
+    if "cannot find prior path1 or path2 listings" in text:
+        return "needs_resync"
+    if "empty prior path1 listing" in text or "empty prior path2 listing" in text:
+        return "needs_resync"
+    if "too many deletes" in text:
+        return "too_many_deletes"
+    if "empty current path1 listing" in text:
+        return "empty_local"
+    if "empty current path2 listing" in text:
+        return "empty_remote"
+    if any(hint in text for hint in AUTH_HINTS):
+        return "auth"
+    if any(hint in text for hint in NETWORK_HINTS):
+        return "offline"
+    if "notfound" in text or "file not found" in text:
+        return "not_found"
+    if "insufficientpermissions" in text or "insufficient permission" in text:
+        return "permission"
+    return "error"
+
+
+def friendly_error(kind, name, errors):
+    quoted = '"%s"' % name
+    if kind == "too_many_deletes":
+        return ("Paused: more than half of the files were deleted on one side. If that was "
+                "intentional, run: gdrive-sync confirm-deletes " + quoted)
+    if kind == "empty_local":
+        return ("Paused: the folder on this computer is empty. Restore the files, or run: gdrive-sync "
+                "confirm-deletes %s to move them to the Google Drive trash too" % quoted)
+    if kind == "empty_remote":
+        return ("Paused: the folder is empty in Google Drive. If that was intentional, run: "
+                "gdrive-sync confirm-deletes %s to move the files on this computer to the Trash" % quoted)
+    if kind == "offline":
+        return "Waiting for an internet connection"
+    if kind == "auth":
+        return "Google Drive sign-in was rejected. Run: gdrive-sync reconnect"
+    if kind == "not_found":
+        return "Folder not found in Google Drive (deleted, or access was removed)"
+    if kind == "permission":
+        return "Google Drive refused a change (no permission)"
+    last = errors[-1] if errors else "unknown error"
+    return "Sync failed: " + last[:200]
+
+
+PHASES = {
+    "Building Path1 and Path2 listings": "Checking for changes",
+    "Applying changes": "Applying changes",
+    "Updating listings": "Finishing",
+}
+
+
+def describe(msg, level, obj, obj_type, label):
+    """Turn one rclone log record into (kind, text, wrote_locally), or None to skip it."""
+    shown = "%s/%s" % (label, obj) if obj else label
+    moved_prefix = "Moved (server-side) to: "
+    if msg.startswith("Copied ("):
+        if obj_type == "*drive.Object":
+            return "down", "Downloaded " + shown, True
+        return "up", "Uploaded " + shown, False
+    if msg == "Deleted":
+        if obj_type == "*drive.Object":
+            return "delete", "Deleted in Google Drive: " + shown, False
+        return "delete", "Deleted on this computer: " + shown, True
+    if msg.startswith(moved_prefix):
+        return ("conflict", "Kept the older version as %s/%s" % (label, msg[len(moved_prefix):]),
+                obj_type == "*local.Object")
+    if "New or changed in both paths" in msg:
+        return "conflict", "Changed on both sides: %s/%s" % (label, msg.rsplit(" - ", 1)[-1].strip()), False
+    if msg == "Building Path1 and Path2 listings":
+        return "info", "%s: checking for changes…" % label, False
+    if msg.startswith("Resync is copying files"):
+        return "info", "%s: first sync…" % label, False
+    if level == "error" and not msg.startswith(("Bisync aborted", "Bisync critical error")):
+        return "error", "%s: %s" % (label, msg[:240]), False
+    return None
+
+
+def transfer_entry(raw, label):
+    return {
+        "name": "%s/%s" % (label, raw.get("name", "")),
+        "direction": "up" if str(raw.get("srcFs", "")).startswith("/") else "down",
+        "percent": raw.get("percentage", 0),
+        "bytes": raw.get("bytes", 0),
+        "size": raw.get("size", 0),
+        "speed": raw.get("speed", 0),
+        "eta": raw.get("eta"),
+    }
+
+
+def progress_from_stats(stats):
+    done, total = stats.get("bytes", 0), stats.get("totalBytes", 0)
+    files, total_files = stats.get("transfers", 0), stats.get("totalTransfers", 0)
+    percent = None
+    if total > 0:
+        percent = min(100, int(done * 100 / total))
+    elif total_files > 0:
+        percent = min(100, int(files * 100 / total_files))
+    return {"percent": percent, "bytes": done, "total_bytes": total, "files": files,
+            "total_files": total_files, "speed": stats.get("speed", 0), "eta": stats.get("eta")}
+
+
+def move_to_trash(path, data_home, use_gio=True):
+    gio = shutil.which("gio") if use_gio else None
+    if gio and subprocess.run([gio, "trash", path], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    files_dir = os.path.join(data_home, "Trash", "files")
+    info_dir = os.path.join(data_home, "Trash", "info")
+    os.makedirs(files_dir, exist_ok=True)
+    os.makedirs(info_dir, exist_ok=True)
+    base = os.path.basename(os.path.normpath(path))
+    name, n = base, 1
+    while True:
+        info_path = os.path.join(info_dir, name + ".trashinfo")
+        try:
+            fd = os.open(info_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            n += 1
+            name = "%s.%d" % (base, n)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("[Trash Info]\nPath=%s\nDeletionDate=%s\n" % (
+            urllib.parse.quote(os.path.abspath(path)), datetime.now().strftime("%Y-%m-%dT%H:%M:%S")))
+    try:
+        os.rename(path, os.path.join(files_dir, name))
+    except OSError:
+        os.unlink(info_path)
+        raise
+
+
+def nested_skip(starred_ids, descendants):
+    """Starred folders inside another starred folder are already synced by their ancestor."""
+    return {child for parent in starred_ids for child in descendants.get(parent, ())
+            if child in starred_ids and child != parent}
+
+
+class RcloneFailure(Exception):
+    def __init__(self, errors):
+        super().__init__(errors[-1] if errors else "rclone failed")
+        self.errors = errors
+
+
+class RunResult:
+    def __init__(self, returncode, errors, local_writes, interrupted):
+        self.returncode = returncode
+        self.errors = errors
+        self.local_writes = local_writes
+        self.interrupted = interrupted
+        self.ok = returncode == 0 and not interrupted
+        self.kind = None if self.ok else classify(errors)
+
+
+# ---------------------------------------------------------------- daemon
+
+class Daemon:
+    def __init__(self, paths, config):
+        self.paths = paths
+        self.cfg = config
+        self.lock = threading.RLock()
+        self.wake = threading.Event()
+        self.stopping = False
+        self.sync_requested = False
+        self.child = None
+        self.state = read_json(paths.state_file, {})
+        self.state.setdefault("folders", {})
+        self.state.setdefault("nested", {"key": "", "skip": [], "time": 0})
+        self.activity = deque(maxlen=ACTIVITY_LIMIT)
+        self.phase = "starting"
+        self.message = "Starting…"
+        self.current = None
+        self.progress = None
+        self.transfers = []
+        self.last_sync = self.state.get("last_sync")
+        self.next_sync = None
+        self.offline = False
+        self.warning = None
+        self.dirty = True
+        self.last_write = 0.0
+        self.synced_sig = None
+        self.watch = {"sig": None, "first": None, "changed": None, "last_scan": 0.0, "every": 3.0}
+
+    # ---- bookkeeping
+    def save_state(self):
+        with self.lock:
+            self.state["last_sync"] = self.last_sync
+            write_json_atomic(self.paths.state_file, self.state)
+
+    def note(self, kind, text):
+        with self.lock:
+            self.activity.appendleft({"time": time.time(), "kind": kind, "text": text})
+            self.dirty = True
+        print("[%s] %s" % (kind, text), flush=True)
+
+    def set_phase(self, phase, message):
+        with self.lock:
+            self.phase, self.message, self.dirty = phase, message, True
+
+    def local_path(self, rec):
+        return os.path.join(self.cfg.folder, rec["local"])
+
+    def folder_status(self, rec):
+        if self.current and self.current["id"] == rec["id"]:
+            state = "syncing"
+        elif rec.get("retiring"):
+            state = "retiring"
+        elif rec.get("error_kind") == "offline":
+            state = "waiting"
+        elif rec.get("error"):
+            state = "error"
+        elif rec.get("last_sync"):
+            state = "synced"
+        else:
+            state = "pending"
+        return {"id": rec["id"], "name": rec["name"], "path": self.local_path(rec), "state": state,
+                "last_sync": rec.get("last_sync"), "error": rec.get("error")}
+
+    def snapshot_status(self):
+        with self.lock:
+            folders = sorted(self.state["folders"].values(), key=lambda r: r["name"].lower())
+            errors = [r for r in folders if r.get("error") and r.get("error_kind") != "offline"]
+            if self.phase == "stopped":
+                state = "stopped"
+            elif self.current is not None or self.phase == "syncing":
+                state = "syncing"
+            elif self.offline:
+                state = "offline"
+            elif errors:
+                state = "error"
+            else:
+                state = "idle"
+            return {
+                "version": 2, "updated": time.time(), "pid": os.getpid(), "state": state,
+                "message": self.message, "warning": self.warning, "folder": self.cfg.folder,
+                "last_sync": self.last_sync, "next_sync": self.next_sync,
+                "sync_requested": self.sync_requested,
+                "current": dict(self.current) if self.current else None,
+                "progress": dict(self.progress) if self.progress else None,
+                "transfers": list(self.transfers),
+                "folders": [self.folder_status(r) for r in folders],
+                "activity": list(self.activity),
+            }
+
+    def status_writer(self):
+        while True:
+            now = time.time()
+            if self.dirty or now - self.last_write >= STATUS_HEARTBEAT_SECONDS:
+                self.dirty = False
+                try:
+                    snapshot = self.snapshot_status()
+                    write_json_atomic(self.paths.status_file, snapshot)
+                    self.last_write = now
+                except Exception as e:  # the status display must never die
+                    print("could not write status: %s" % e, flush=True)
+                    snapshot = {}
+                if snapshot.get("state") == "stopped":
+                    return
+            time.sleep(0.5)
+
+    # ---- running rclone
+    def run_rclone(self, argv, label):
+        errors, local_writes = [], 0
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE, text=True, errors="replace",
+                                   start_new_session=True)
+        with self.lock:
+            self.child = process
+        try:
+            for line in process.stderr:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    if line.strip():
+                        errors.append(line.strip())
+                    continue
+                stats = record.get("stats")
+                if stats is not None:
+                    with self.lock:
+                        self.progress = progress_from_stats(stats)
+                        self.transfers = [transfer_entry(t, label) for t in stats.get("transferring") or []]
+                        self.dirty = True
+                    continue
+                msg = (record.get("msg") or "").strip()
+                level = record.get("level", "")
+                if "shared Google Drive client_id" in msg:
+                    with self.lock:
+                        self.warning = CLIENT_ID_WARNING
+                    continue
+                if level in ("error", "critical", "alert", "emergency"):
+                    errors.append(msg)
+                phase = PHASES.get(msg) or ("First sync" if msg.startswith("Resync is copying files") else None)
+                if phase:
+                    with self.lock:
+                        if self.current:
+                            self.current["phase"], self.dirty = phase, True
+                described = describe(msg, level, record.get("object", ""), record.get("objectType", ""), label)
+                if described:
+                    kind, text, wrote = described
+                    local_writes += wrote
+                    self.note(kind, text)
+        finally:
+            returncode = process.wait()
+            with self.lock:
+                self.child = None
+                self.transfers = []
+        return RunResult(returncode, errors, local_writes, self.stopping)
+
+    def common_flags(self):
+        flags = ["--drive-skip-gdocs", "--drive-skip-shortcuts", "--fast-list",
+                 "--local-encoding", "Slash,Dot,Ctl",
+                 "--color", "NEVER", "--use-json-log", "-v", "--stats", "1s"]
+        for pattern in EXCLUDES:
+            flags += ["--exclude", pattern]
+        return flags
+
+    def run_bisync(self, rec, resync=False, force=False):
+        workdir = os.path.join(self.paths.folder_dir(rec["id"]), "bisync")
+        os.makedirs(workdir, exist_ok=True)
+        argv = [self.cfg.rclone, "bisync", self.local_path(rec), self.cfg.remote_spec(rec["id"]),
+                "--workdir", workdir, "--resilient", "--recover", "--max-lock", "2m",
+                "--conflict-resolve", "newer", "--conflict-loser", "num",
+                "--create-empty-src-dirs"] + self.common_flags()
+        if resync:
+            argv += ["--resync", "--resync-mode", "newer"]
+        if force:
+            argv.append("--force")
+        return self.run_rclone(argv, rec["local"])
+
+    # ---- Google Drive queries
+    def rclone_json(self, argv, timeout=600):
+        try:
+            proc = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise RcloneFailure(["timed out talking to Google Drive (i/o timeout)"])
+        if "shared Google Drive client_id" in proc.stderr:
+            with self.lock:
+                self.warning = CLIENT_ID_WARNING
+        if proc.returncode != 0:
+            lines = [l for l in proc.stderr.splitlines() if l.strip() and "client_id" not in l]
+            raise RcloneFailure(lines or ["rclone exited with code %d" % proc.returncode])
+        try:
+            return json.loads(proc.stdout) or []
+        except ValueError:
+            raise RcloneFailure(["unexpected output from rclone"])
+
+    def query_starred(self):
+        starred = self.rclone_json([self.cfg.rclone, "backend", "query", self.cfg.remote + ":", STARRED_QUERY])
+        return [{"id": f["id"], "name": f.get("name") or f["id"]} for f in starred if f.get("id")]
+
+    def compute_nested(self, ids):
+        key = ",".join(sorted(ids))
+        cached = self.state["nested"]
+        if cached.get("key") == key and time.time() - cached.get("time", 0) < NESTED_RECHECK_SECONDS:
+            return set(cached.get("skip", []))
+        descendants, complete = {}, True
+        if len(ids) >= 2:
+            self.set_phase("syncing", "Checking which starred folders contain each other…")
+            for folder_id in ids:
+                try:
+                    listing = self.rclone_json([self.cfg.rclone, "lsjson", "-R", "--dirs-only", "--fast-list",
+                                                "--no-modtime", "--no-mimetype", "--drive-skip-shortcuts",
+                                                self.cfg.remote_spec(folder_id)])
+                except RcloneFailure as e:
+                    if classify(e.errors) == "offline":
+                        raise
+                    complete = False
+                    continue
+                descendants[folder_id] = {item.get("ID") for item in listing if item.get("ID")}
+        skip = nested_skip(set(ids), descendants)
+        if complete:
+            self.state["nested"] = {"key": key, "skip": sorted(skip), "time": time.time()}
+        return skip
+
+    # ---- folder lifecycle
+    def owner_of(self, path):
+        try:
+            with open(os.path.join(path, MARKER), encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def choose_local_name(self, folder):
+        base = local_name(folder["name"])
+        taken = {r["local"] for r in self.state["folders"].values() if r["id"] != folder["id"]}
+        candidate, n = base, 1
+        while True:
+            path = os.path.join(self.cfg.folder, candidate)
+            if candidate not in taken:
+                if not os.path.lexists(path):
+                    return candidate
+                if os.path.isdir(path) and not os.path.islink(path) and \
+                        (self.owner_of(path) == folder["id"] or not os.listdir(path)):
+                    return candidate
+            n += 1
+            candidate = "%s (%d)" % (base, n)
+
+    def reconcile(self, starred, skip):
+        with self.lock:
+            return self._reconcile(starred, skip)
+
+    def _reconcile(self, starred, skip):
+        folders = self.state["folders"]
+        active = []
+        for folder in starred:
+            if folder["id"] in skip:
+                continue
+            rec = folders.get(folder["id"])
+            if rec is None:
+                rec = {"id": folder["id"], "name": folder["name"], "local": self.choose_local_name(folder),
+                       "needs_resync": True, "filters": FILTER_VERSION, "missing": 0, "last_sync": None,
+                       "error": None, "error_kind": None, "force": False}
+                folders[folder["id"]] = rec
+                self.note("info", "Now syncing \"%s\"" % folder["name"])
+            else:
+                rec["missing"] = 0
+                rec.pop("retiring", None)
+                rec["drive_name"] = folder["name"]
+            active.append(rec)
+        present = {f["id"] for f in starred if f["id"] not in skip}
+        retire = []
+        for rec in folders.values():
+            if rec["id"] not in present:
+                rec["missing"] = rec.get("missing", 0) + 1
+                if rec["missing"] >= RETIRE_AFTER_MISSES:
+                    rec["retiring"] = True
+                    retire.append(rec)
+        active.sort(key=lambda r: r["name"].lower())
+        return active, retire
+
+    def ensure_local(self, rec):
+        path = self.local_path(rec)
+        if not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+            if rec.get("last_sync"):
+                self.note("info", "\"%s\" was missing on this computer; downloading it again" % rec["name"])
+            rec["needs_resync"] = True
+        if self.owner_of(path) != rec["id"]:
+            with open(os.path.join(path, MARKER), "w", encoding="utf-8") as f:
+                f.write(rec["id"] + "\n")
+        if rec.get("filters") != FILTER_VERSION:
+            rec["needs_resync"] = True
+
+    def apply_confirmed_empty(self, rec):
+        """User confirmed that a folder emptied on one side should be emptied on the other too."""
+        local = self.local_path(rec)
+        if rec.get("error_kind") == "empty_local":
+            result = self.run_rclone([self.cfg.rclone, "delete", self.cfg.remote_spec(rec["id"])]
+                                     + self.common_flags(), rec["local"])
+            if not result.ok:
+                return result
+            self.note("delete", "Moved the files of \"%s\" to the Google Drive trash" % rec["name"])
+        else:
+            for entry in os.listdir(local):
+                if entry != MARKER:
+                    move_to_trash(os.path.join(local, entry), self.paths.data_home)
+            self.note("delete", "Moved the files of \"%s\" on this computer to the Trash" % rec["name"])
+        return self.run_bisync(rec, resync=True)
+
+    def sync_folder(self, rec, index, count):
+        with self.lock:
+            self.current = {"id": rec["id"], "folder": rec["local"], "index": index, "count": count,
+                            "phase": "Starting"}
+            self.progress = None
+            self.message = "Syncing \"%s\" (%d of %d)" % (rec["local"], index, count)
+            self.dirty = True
+        self.ensure_local(rec)
+        force = rec.get("force", False)
+        if force and rec.get("error_kind") in ("empty_local", "empty_remote"):
+            result = self.apply_confirmed_empty(rec)
+        else:
+            result = self.run_bisync(rec, resync=rec.get("needs_resync", False),
+                                     force=force and rec.get("error_kind") == "too_many_deletes")
+            if result.kind == "needs_resync" and not self.stopping:
+                rec["needs_resync"] = True
+                result = self.run_bisync(rec, resync=True)
+        if result.ok:
+            rec.update(needs_resync=False, filters=FILTER_VERSION, force=False, error=None,
+                       error_kind=None, last_sync=time.time())
+            self.rename_if_needed(rec)
+        elif not result.interrupted:
+            rec["error_kind"] = result.kind
+            rec["error"] = friendly_error(result.kind, rec["local"], result.errors)
+            if result.kind != "offline":
+                self.note("error", "%s: %s" % (rec["local"], rec["error"]))
+        with self.lock:
+            self.current = None
+            self.progress = None
+            self.dirty = True
+        self.save_state()
+        return result
+
+    def rename_if_needed(self, rec):
+        wanted = local_name(rec.get("drive_name", rec["name"]))
+        if rec.get("drive_name"):
+            rec["name"] = rec["drive_name"]
+        if wanted == rec["local"] or rec["local"].startswith(wanted + " ("):
+            return
+        new_local = self.choose_local_name({"id": rec["id"], "name": rec["name"]})
+        if new_local == rec["local"]:
+            return
+        old_path, new_path = self.local_path(rec), os.path.join(self.cfg.folder, new_local)
+        try:
+            os.rename(old_path, new_path)
+        except OSError as e:
+            self.note("error", "Could not rename \"%s\" to match Google Drive: %s" % (rec["local"], e))
+            return
+        self.note("info", "Renamed \"%s\" to \"%s\" to match Google Drive" % (rec["local"], new_local))
+        rec["local"] = new_local
+        shutil.rmtree(os.path.join(self.paths.folder_dir(rec["id"]), "bisync"), ignore_errors=True)
+        result = self.run_bisync(rec, resync=True)
+        rec["needs_resync"] = not result.ok
+
+    def retire(self, rec):
+        local = self.local_path(rec)
+        if os.path.isdir(local) and rec.get("last_sync") and not rec.get("needs_resync"):
+            with self.lock:
+                self.message = "Final sync of \"%s\" before removing it from this computer" % rec["local"]
+                self.dirty = True
+            result = self.run_bisync(rec)
+            if not result.ok and result.kind not in ("not_found", "empty_remote"):
+                rec["error_kind"] = result.kind
+                rec["error"] = "No longer starred, but the final sync failed; the folder is kept for now"
+                return
+        if os.path.isdir(local):
+            try:
+                move_to_trash(local, self.paths.data_home)
+            except OSError as e:
+                rec["error"] = "No longer starred, but moving the folder to the Trash failed: %s" % e
+                return
+            self.note("info", "\"%s\" is no longer starred: moved it to the Trash" % rec["name"])
+        shutil.rmtree(self.paths.folder_dir(rec["id"]), ignore_errors=True)
+        with self.lock:
+            del self.state["folders"][rec["id"]]
+            self.dirty = True
+
+    def consume_requests(self):
+        try:
+            names = os.listdir(self.paths.request_dir)
+        except OSError:
+            return
+        for name in names:
+            path = os.path.join(self.paths.request_dir, name)
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            with self.lock:
+                rec = self.state["folders"].get(name[6:]) if name.startswith("force-") else None
+                if rec is not None:
+                    rec["force"] = True
+            if rec is not None:
+                self.note("info", "Deletions confirmed for \"%s\"" % rec["name"])
+
+    # ---- cycles
+    def managed_roots(self):
+        return [self.local_path(r) for r in self.state["folders"].values()
+                if os.path.isdir(self.local_path(r))]
+
+    def run_cycle(self):
+        self.set_phase("syncing", "Looking for starred folders…")
+        self.consume_requests()
+        sig_before, _ = tree_signature(self.managed_roots())
+        try:
+            starred = self.query_starred()
+            skip = self.compute_nested([f["id"] for f in starred])
+        except RcloneFailure as e:
+            kind = classify(e.errors)
+            with self.lock:
+                self.offline = kind == "offline"
+                self.message = friendly_error(kind, "", e.errors)
+            if kind != "offline":
+                self.note("error", self.message)
+            self.set_phase("idle", self.message)
+            return "offline" if kind == "offline" else "error"
+        with self.lock:
+            self.offline = False
+        active, retire = self.reconcile(starred, skip)
+        self.save_state()
+        local_writes, results = 0, []
+        for index, rec in enumerate(active, 1):
+            if self.stopping:
+                break
+            result = self.sync_folder(rec, index, len(active))
+            local_writes += result.local_writes
+            results.append(result)
+        for rec in retire:
+            if self.stopping:
+                break
+            self.retire(rec)
+        self.save_state()
+        sig_after, count = tree_signature(self.managed_roots())
+        # A cycle that wrote nothing locally but saw the tree change means the user edited during it.
+        self.synced_sig = sig_before if local_writes == 0 and sig_before != sig_after else sig_after
+        self.watch.update(sig=None, first=None, every=3.0 if count < 5000 else 30.0)
+        offline = bool(results) and all(r.kind == "offline" for r in results)
+        failed = [r for r in results if not r.ok and not r.interrupted]
+        with self.lock:
+            self.offline = offline
+            if any(r.ok for r in results) or not results:
+                self.last_sync = time.time()
+            if offline:
+                self.message = "No internet connection: changes will sync when it's back"
+            elif not active:
+                self.message = "No starred folders yet: star one of your folders in Google Drive"
+            elif failed:
+                self.message = ("1 folder needs attention" if len(failed) == 1
+                                else "%d folders need attention" % len(failed))
+            else:
+                self.message = "Up to date"
+        self.set_phase("idle", self.message)
+        return "offline" if offline else "ok"
+
+    def local_change_ready(self, now):
+        watch = self.watch
+        if now - watch["last_scan"] < watch["every"] or self.synced_sig is None:
+            return False
+        watch["last_scan"] = now
+        sig, count = tree_signature(self.managed_roots())
+        watch["every"] = 3.0 if count < 5000 else 30.0
+        if sig == self.synced_sig:
+            watch.update(sig=None, first=None)
+            return False
+        if watch["sig"] != sig:
+            watch["sig"], watch["changed"] = sig, now
+            watch["first"] = watch["first"] or now
+        return now - watch["changed"] >= 4 or now - watch["first"] >= 60
+
+    def handle_signal(self, signum, _frame):
+        if signum == signal.SIGUSR1:
+            self.sync_requested = True
+            self.dirty = True
+        else:
+            self.stopping = True
+            child = self.child
+            if child is not None and child.poll() is None:
+                try:
+                    child.send_signal(signal.SIGINT)
+                except OSError:
+                    pass
+        self.wake.set()
+
+    def run(self):
+        os.makedirs(self.paths.state_dir, exist_ok=True)
+        os.makedirs(self.paths.request_dir, exist_ok=True)
+        os.makedirs(self.cfg.folder, exist_ok=True)
+        lock = open(self.paths.lock_file, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit("another gdrive-sync daemon is already running")
+        if not os.access(self.cfg.rclone, os.X_OK):
+            raise SystemExit("rclone not found at %s" % self.cfg.rclone)
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
+            signal.signal(signum, self.handle_signal)
+        writer = threading.Thread(target=self.status_writer, daemon=True)
+        writer.start()
+        self.note("info", "Sync service started")
+        next_due, backoff = 0.0, 30
+        while not self.stopping:
+            now = time.time()
+            if self.sync_requested or now >= next_due or self.local_change_ready(now):
+                manual = self.sync_requested
+                self.sync_requested = False
+                if manual:
+                    self.note("info", "Sync requested")
+                outcome = self.run_cycle()
+                if outcome == "offline":
+                    delay, backoff = backoff, min(backoff * 2, self.cfg.interval)
+                else:
+                    delay, backoff = self.cfg.interval, 30
+                next_due = time.time() + delay
+                with self.lock:
+                    self.next_sync, self.dirty = next_due, True
+                continue
+            self.wake.wait(1.0)
+            self.wake.clear()
+        self.set_phase("stopped", "Sync service stopped")
+        writer.join(timeout=5)
+
+
+# ---------------------------------------------------------------- CLI
+
+def human_time(ts):
+    if not ts:
+        return "never"
+    delta = time.time() - ts
+    if delta < 60:
+        return "just now"
+    if delta < 3600:
+        return "%d min ago" % (delta // 60)
+    if delta < 86400:
+        return "%d h ago" % (delta // 3600)
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def load_status(paths):
+    status = read_json(paths.status_file, None)
+    if not status or (status.get("state") != "stopped" and time.time() - status.get("updated", 0) > 20):
+        return None
+    return status
+
+
+def cmd_status(paths):
+    status = load_status(paths)
+    if status is None or status["state"] == "stopped":
+        print("The sync service is not running. Start it with: systemctl --user start gdrive-sync")
+        return 1
+    print("%s — %s" % (status["state"].upper(), status["message"]))
+    if status.get("warning"):
+        print("Warning: " + status["warning"])
+    progress = status.get("progress")
+    if progress and progress.get("percent") is not None:
+        print("Progress: %d%% (%d of %d files)" % (progress["percent"], progress["files"], progress["total_files"]))
+    for t in status.get("transfers", []):
+        print("  %s %3d%%  %s" % ("↑" if t["direction"] == "up" else "↓", t["percent"], t["name"]))
+    print("Last sync: %s" % human_time(status.get("last_sync")))
+    print("\nSynced folders (in %s):" % status["folder"])
+    for f in status["folders"]:
+        print("  [%s] %s%s" % (f["state"], f["name"], " — " + f["error"] if f.get("error") else ""))
+    if not status["folders"]:
+        print("  none yet: star one of your folders in Google Drive")
+    print("\nRecent activity:")
+    for a in status["activity"][:10]:
+        print("  %s  %s" % (datetime.fromtimestamp(a["time"]).strftime("%H:%M:%S"), a["text"]))
+    return 0
+
+
+def cmd_now():
+    kill = subprocess.run(["systemctl", "--user", "kill", "--signal=SIGUSR1", "--kill-whom=main",
+                           "gdrive-sync.service"], stderr=subprocess.DEVNULL)
+    if kill.returncode != 0:
+        return subprocess.run(["systemctl", "--user", "start", "gdrive-sync.service"]).returncode
+    return 0
+
+
+def cmd_confirm_deletes(paths, name):
+    status = load_status(paths)
+    if status is None or status["state"] == "stopped":
+        print("The sync service is not running.")
+        return 1
+    matches = [f for f in status["folders"] if name in (f["name"], os.path.basename(f["path"]))]
+    if not matches:
+        print("No synced folder named %r" % name)
+        return 1
+    os.makedirs(paths.request_dir, exist_ok=True)
+    open(os.path.join(paths.request_dir, "force-" + matches[0]["id"]), "w").close()
+    print("Confirmed. The deletions in %r will be applied on the next sync." % matches[0]["name"])
+    return cmd_now()
+
+
+def main(argv):
+    paths = Paths()
+    command = argv[1] if len(argv) > 1 else "status"
+    if command == "daemon":
+        Daemon(paths, Config(paths)).run()
+        return 0
+    if command == "status":
+        return cmd_status(paths)
+    if command == "now":
+        return cmd_now()
+    if command == "confirm-deletes" and len(argv) == 3:
+        return cmd_confirm_deletes(paths, argv[2])
+    if command == "reconnect":
+        cfg = Config(paths)
+        return subprocess.run([cfg.rclone, "config", "reconnect", cfg.remote + ":"]).returncode
+    if command in ("version", "--version"):
+        print("gdrive-sync " + VERSION)
+        return 0
+    print("usage: gdrive-sync [status | now | confirm-deletes FOLDER | reconnect | daemon | version]")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

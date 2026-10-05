@@ -1,0 +1,35 @@
+.gdrive-sync-label {
+  padding-left: 4px;
+  font-feature-settings: "tnum";
+}
+
+.gdrive-sync-title {
+  font-weight: bold;
+  max-width: 26em;
+}
+
+.gdrive-sync-small {
+  font-size: 0.85em;
+  max-width: 26em;
+}
+
+.gdrive-sync-path {
+  max-width: 26em;
+}
+
+.gdrive-sync-progress {
+  height: 6px;
+  margin-top: 4px;
+}
+
+.gdrive-sync-percent {
+  font-size: 0.85em;
+  font-feature-settings: "tnum";
+  padding-left: 8px;
+}
+
+.gdrive-sync-time {
+  font-size: 0.85em;
+  font-feature-settings: "tnum";
+  padding-right: 6px;
+}

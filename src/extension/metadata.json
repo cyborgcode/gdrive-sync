@@ -1,0 +1,7 @@
+{
+  "uuid": "gdrive-sync@local",
+  "name": "Google Drive Sync",
+  "description": "Live status, progress and a Sync now button for gdrive-sync, which keeps your starred Google Drive folders on this computer.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "version-name": "1.1.0"
+}

@@ -1,0 +1,1 @@
+{"uuid": "test-helper@local", "name": "Test helper", "description": "Drives the gdrive-sync menu in headless tests", "shell-version": ["45", "46", "47", "48", "49", "50", "51"]}
