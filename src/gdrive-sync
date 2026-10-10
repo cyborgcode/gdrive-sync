@@ -47,8 +47,6 @@ NETWORK_HINTS = (
 )
 AUTH_HINTS = ("invalid_client", "invalid_grant", "unauthorized_client", "oauth2: cannot fetch token",
               "couldn't fetch token", "token expired")
-CLIENT_ID_WARNING = ("This Google Drive connection uses rclone's shared client ID, which Google is "
-                     "retiring. Run the installer again to add your own client ID.")
 
 
 class Paths:
@@ -335,7 +333,6 @@ class Daemon:
         self.last_sync = self.state.get("last_sync")
         self.next_sync = None
         self.offline = False
-        self.warning = None
         self.dirty = True
         self.last_write = 0.0
         self.synced_sig = None
@@ -392,7 +389,7 @@ class Daemon:
                 state = "idle"
             return {
                 "version": 2, "updated": time.time(), "pid": os.getpid(), "state": state,
-                "message": self.message, "warning": self.warning, "folder": self.cfg.folder,
+                "message": self.message, "folder": self.cfg.folder,
                 "last_sync": self.last_sync, "next_sync": self.next_sync,
                 "sync_requested": self.sync_requested,
                 "current": dict(self.current) if self.current else None,
@@ -444,8 +441,6 @@ class Daemon:
                 msg = (record.get("msg") or "").strip()
                 level = record.get("level", "")
                 if "shared Google Drive client_id" in msg:
-                    with self.lock:
-                        self.warning = CLIENT_ID_WARNING
                     continue
                 if level in ("error", "critical", "alert", "emergency"):
                     errors.append(msg)
@@ -494,9 +489,6 @@ class Daemon:
                                   errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             raise RcloneFailure(["timed out talking to Google Drive (i/o timeout)"])
-        if "shared Google Drive client_id" in proc.stderr:
-            with self.lock:
-                self.warning = CLIENT_ID_WARNING
         if proc.returncode != 0:
             lines = [l for l in proc.stderr.splitlines() if l.strip() and "client_id" not in l]
             raise RcloneFailure(lines or ["rclone exited with code %d" % proc.returncode])
@@ -868,8 +860,6 @@ def cmd_status(paths):
         print("The sync service is not running. Start it with: systemctl --user start gdrive-sync")
         return 1
     print("%s — %s" % (status["state"].upper(), status["message"]))
-    if status.get("warning"):
-        print("Warning: " + status["warning"])
     progress = status.get("progress")
     if progress and progress.get("percent") is not None:
         print("Progress: %d%% (%d of %d files)" % (progress["percent"], progress["files"], progress["total_files"]))

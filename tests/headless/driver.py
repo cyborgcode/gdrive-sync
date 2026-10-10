@@ -82,7 +82,7 @@ def base(now):
         {"time": now - 63, "kind": "down", "text": "Downloaded AI/d.pdf"},
         {"time": now - 64, "kind": "error", "text": "logo: googleapi: Error 403: Rate limit exceeded"},
     ]
-    return {"version": 1, "pid": 1, "warning": None, "offline_dir": "/tmp/x", "mount_dir": "/tmp/y",
+    return {"version": 1, "pid": 1, "offline_dir": "/tmp/x", "mount_dir": "/tmp/y",
             "last_sync": now - 130, "next_sync": now + 170, "folders": folders, "activity": activity,
             "mount": {"running": True, "transfers": [], "queued_uploads": 0}, "transfers": [],
             "current": None, "progress": None}
@@ -110,9 +110,7 @@ if SCENARIO == "synthetic":
                         {"name": "AI/Datasets/cifar.zip", "direction": "down", "percent": 12,
                          "bytes": 2e6, "size": 17e6, "speed": 0.4e6, "eta": 37},
                         {"name": "AI/Papers/attention.pdf", "direction": "down", "percent": 88,
-                         "bytes": 1.9e6, "size": 2.2e6, "speed": 0.3e6, "eta": 1}],
-             warning="This Google Drive connection uses rclone's shared client ID, which Google is retiring. "
-                     "Run: gdrive-sync reconnect")
+                         "bytes": 1.9e6, "size": 2.2e6, "speed": 0.3e6, "eta": 1}])
     s["mount"]["transfers"] = [{"name": "Google Drive/philooo.pdf", "direction": "up", "percent": 35,
                                 "bytes": 160e3, "size": 455e3, "speed": 100e3, "eta": 3}]
     for i in range(4):

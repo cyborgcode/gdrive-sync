@@ -185,21 +185,6 @@ class HeaderRow extends InfoRow {
     }
 });
 
-const NoteRow = GObject.registerClass(
-class NoteRow extends InfoRow {
-    _init(icon) {
-        super._init();
-        this.add_child(new St.Icon({gicon: icon, style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START}));
-        this._text = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.NONE, {x_expand: true});
-        setWrapped(this._text, true);
-        this.add_child(this._text);
-    }
-
-    update(text) {
-        this._text.text = text;
-    }
-});
-
 const ProgressRow = GObject.registerClass(
 class ProgressRow extends InfoRow {
     _init() {
@@ -350,7 +335,7 @@ class Indicator extends PanelMenu.Button {
         this.add_child(box);
 
         this._expanded = loadExpanded();
-        this._buildMenu(warning);
+        this._buildMenu();
         this.menu.connect('open-state-changed', (menu, open) => {
             if (open) {
                 this._renderMenu();
@@ -365,11 +350,9 @@ class Indicator extends PanelMenu.Button {
         });
     }
 
-    _buildMenu(warningIcon) {
+    _buildMenu() {
         this._header = new HeaderRow();
         this.menu.addMenuItem(this._header);
-        this._warning = new NoteRow(warningIcon);
-        this.menu.addMenuItem(this._warning);
         this._progressRow = new ProgressRow();
         this.menu.addMenuItem(this._progressRow);
 
@@ -528,7 +511,6 @@ class Indicator extends PanelMenu.Button {
 
         if (!running) {
             this._header.update("The sync service isn't running", 'Start it to keep your starred folders in sync');
-            this._warning.visible = false;
             this._progressRow.visible = false;
             for (const item of [this._activitySeparator, this._activityHeader, this._foldersSeparator,
                 this._foldersHeader])
@@ -540,9 +522,6 @@ class Indicator extends PanelMenu.Button {
 
         const [title, subtitle] = this._headerText(s);
         this._header.update(title, subtitle);
-        this._warning.visible = Boolean(s.warning);
-        if (s.warning)
-            this._warning.update(s.warning);
 
         const percent = s.progress?.percent;
         this._progressRow.visible = s.state === 'syncing' && percent !== null && percent !== undefined;
