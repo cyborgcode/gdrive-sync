@@ -4,10 +4,10 @@
 import configparser
 import fcntl
 import fnmatch
-import hashlib
 import itertools
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -33,6 +33,8 @@ EXCLUDES = [
     "*.swp",
     ".Trash-*/**",
 ]
+# The name-only EXCLUDES as one regex, so the local change scan does a single match per file
+EXCLUDED_NAME = re.compile("|".join(fnmatch.translate(p) for p in EXCLUDES if "/" not in p))
 FOLDER_MIME = "application/vnd.google-apps.folder"
 # Only folders you own: folders shared with you are never synced.
 STARRED_QUERY = ("starred = true and mimeType = '%s' and trashed = false and 'me' in owners"
@@ -125,38 +127,40 @@ def local_name(drive_name):
     return name
 
 
-def is_excluded(rel):
-    parts = rel.split("/")
-    if rel == MARKER:
-        return True
-    if any(fnmatch.fnmatchcase(p, ".Trash-*") for p in parts[:-1]):
-        return True
-    base = parts[-1]
-    return any(fnmatch.fnmatchcase(base, pattern)
-               for pattern in EXCLUDES if "/" not in pattern)
-
-
 def tree_signature(roots):
-    digest = hashlib.blake2b(digest_size=16)
-    count = 0
+    """Fingerprint of what bisync would sync under roots, and how many entries it covers.
+
+    It is a sum of per-entry hashes, so the scan order does not matter and nothing needs sorting.
+    Python's hash() is only stable within one process, which is fine: signatures are compared
+    within one daemon run and never stored.
+    """
+    total, count = 0, 0
     for root in roots:
-        digest.update(root.encode("utf-8", "surrogateescape") + b"\0")
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames.sort()
-            dirnames[:] = [d for d in dirnames if not fnmatch.fnmatchcase(d, ".Trash-*")]
-            for name in sorted(filenames) + ["/" + d for d in dirnames]:
-                path = os.path.join(dirpath, name.lstrip("/"))
-                rel = os.path.relpath(path, root)
-                if is_excluded(rel):
-                    continue
-                try:
-                    st = os.lstat(path)
-                except OSError:
-                    continue
-                count += 1
-                digest.update(("%s\0%d\0%d\0" % (name, st.st_size, st.st_mtime_ns))
-                              .encode("utf-8", "surrogateescape"))
-    return digest.hexdigest(), count
+        total += hash((root,))
+        stack = [(root, "")]
+        while stack:
+            path, rel = stack.pop()
+            try:
+                entries = os.scandir(path)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        if is_dir:
+                            if name.startswith(".Trash-"):
+                                continue
+                            stack.append((entry.path, rel + name + "/"))
+                        elif EXCLUDED_NAME.match(name) or (name == MARKER and not rel):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    count += 1
+                    total += hash((root, rel, name, is_dir, st.st_size, st.st_mtime_ns))
+    return total & 0xFFFFFFFFFFFFFFFF, count
 
 
 def classify(errors):
@@ -528,7 +532,7 @@ class Daemon:
         cached = self.state["nested"]
         if cached.get("key") == key and time.time() - cached.get("time", 0) < NESTED_RECHECK_SECONDS:
             return set(cached.get("skip", []))
-        descendants, complete = {}, True
+        descendants, complete, wanted = {}, True, set(ids)
         if len(ids) >= 2:
             self.set_phase("syncing", "Checking which starred folders contain each other…")
             for folder_id in ids:
@@ -541,8 +545,9 @@ class Daemon:
                         raise
                     complete = False
                     continue
-                descendants[folder_id] = {item.get("ID") for item in listing if item.get("ID")}
-        skip = nested_skip(set(ids), descendants)
+                # Only starred descendants matter; keeping every subfolder ID would hold the whole tree
+                descendants[folder_id] = {item.get("ID") for item in listing} & wanted
+        skip = nested_skip(wanted, descendants)
         if complete:
             self.state["nested"] = {"key": key, "skip": sorted(skip), "time": time.time()}
         return skip

@@ -33,19 +33,6 @@ class NamingTests(unittest.TestCase):
         self.assertIn("starred = true", gds.STARRED_QUERY)
         self.assertIn("trashed = false", gds.STARRED_QUERY)
 
-    def test_is_excluded(self):
-        self.assertTrue(gds.is_excluded(gds.MARKER))
-        self.assertFalse(gds.is_excluded("sub/" + gds.MARKER))
-        self.assertTrue(gds.is_excluded("a/.~lock.report.odt#"))
-        self.assertTrue(gds.is_excluded("~$doc.docx"))
-        self.assertTrue(gds.is_excluded(".Trash-1000/files/x"))
-        self.assertTrue(gds.is_excluded("movie.mkv.part"))
-        self.assertTrue(gds.is_excluded("sub/#10.mp4.282d4537.partial"))
-        self.assertFalse(gds.is_excluded("report.odt"))
-        self.assertIn("'me' in owners", gds.STARRED_QUERY)
-        self.assertIn("starred = true", gds.STARRED_QUERY)
-        self.assertIn("trashed = false", gds.STARRED_QUERY)
-
 
 class ClassifyTests(unittest.TestCase):
     def test_kinds(self):
@@ -130,6 +117,40 @@ class FilesystemTests(unittest.TestCase):
         self.assertNotEqual(sig1, sig2)
         os.rename(os.path.join(folder, "a.txt"), os.path.join(folder, "b.txt"))
         self.assertNotEqual(gds.tree_signature([folder])[0], sig2)
+
+    def test_tree_signature_skips_what_bisync_excludes(self):
+        folder = os.path.join(self.root, "F")
+        write(os.path.join(folder, "report.odt"))
+        sig, count = gds.tree_signature([folder])
+        for rel in (gds.MARKER, "a/.~lock.report.odt#", "~$doc.docx", ".Trash-1000/files/x", "movie.mkv.part",
+                    "sub/#10.mp4.282d4537.partial", "x.crdownload", ".goutputstream-AB12", "a/.Trash-1000/y"):
+            write(os.path.join(folder, rel))
+        # "a" and "sub" are real folders and count; everything inside them here is excluded
+        self.assertEqual(gds.tree_signature([folder])[1], count + 2)
+        write(os.path.join(folder, "sub", gds.MARKER))
+        self.assertEqual(gds.tree_signature([folder])[1], count + 3, "only the top-level marker is excluded")
+        self.assertNotEqual(gds.tree_signature([folder])[0], sig)
+
+    def test_tree_signature_sees_a_move_to_another_synced_folder(self):
+        a, b = os.path.join(self.root, "A"), os.path.join(self.root, "B")
+        write(os.path.join(a, "x", "f.txt"))
+        os.makedirs(os.path.join(b, "x"))
+        dirs = [os.path.join(a, "x"), os.path.join(b, "x")]
+        times = [os.stat(d).st_mtime_ns for d in dirs]
+        sig = gds.tree_signature([a, b])[0]
+        self.assertEqual(gds.tree_signature([b, a])[0], sig, "independent of order")
+        os.rename(os.path.join(a, "x", "f.txt"), os.path.join(b, "x", "f.txt"))
+        for d, t in zip(dirs, times):
+            os.utime(d, ns=(t, t))  # leave the file's synced folder as the only difference
+        self.assertNotEqual(gds.tree_signature([a, b])[0], sig)
+
+    def test_tree_signature_sees_a_same_size_edit(self):
+        path = os.path.join(self.root, "F", "a.txt")
+        write(path, "1")
+        sig = gds.tree_signature([os.path.dirname(path)])[0]
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1))
+        self.assertNotEqual(gds.tree_signature([os.path.dirname(path)])[0], sig)
 
     def test_move_to_trash_fallback_writes_trashinfo(self):
         data_home = os.path.join(self.root, "share")
