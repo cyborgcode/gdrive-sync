@@ -328,7 +328,9 @@ class Indicator extends PanelMenu.Button {
         };
 
         const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
-        this._icon = new St.Icon({gicon: this._icons.panel.idle, style_class: 'system-status-icon'});
+        this._icon = new St.Icon({gicon: this._icons.panel.idle, style_class: 'system-status-icon',
+            pivot_point: new Graphene.Point({x: 0.5, y: 0.5})});
+        this._spinning = false;
         this._label = makeLabel('gdrive-sync-label', Pango.EllipsizeMode.NONE, {visible: false});
         box.add_child(this._icon);
         box.add_child(this._label);
@@ -470,10 +472,28 @@ class Indicator extends PanelMenu.Button {
         }
         this._icon.gicon = icon;
         this._icon.opacity = !s || s.state === 'offline' ? 128 : 255;
+        this._setSpinning(s?.state === 'syncing');
         this._label.text = text;
         this._label.visible = text !== '';
         if (this.menu.isOpen)
             this._renderMenu();
+    }
+
+    // _render runs every second, so only (re)start the endless turn when the state flips
+    _setSpinning(spinning) {
+        if (spinning === this._spinning)
+            return;
+        this._spinning = spinning;
+        this._icon.remove_all_transitions();
+        this._icon.rotation_angle_z = 0;
+        if (spinning) {
+            this._icon.ease({
+                rotation_angle_z: 360,
+                duration: 1500,
+                mode: Clutter.AnimationMode.LINEAR,
+                repeatCount: -1,
+            });
+        }
     }
 
     _headerText(s) {
