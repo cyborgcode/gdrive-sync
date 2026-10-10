@@ -101,6 +101,13 @@ function openPath(path) {
     }
 }
 
+// Activity can point at a file that has since moved or been deleted: open the closest folder still there
+function openNearest(path) {
+    while (!GLib.file_test(path, GLib.FileTest.EXISTS) && GLib.path_get_dirname(path) !== path)
+        path = GLib.path_get_dirname(path);
+    openPath(path);
+}
+
 // St greys out non-reactive widgets; these rows stay reactive for full contrast but ignore clicks and focus
 const InfoRow = GObject.registerClass(
 class InfoRow extends PopupMenu.PopupBaseMenuItem {
@@ -240,23 +247,65 @@ class TransferRow extends InfoRow {
     }
 });
 
+// Entries with a path open it on click; the others behave like InfoRow
 const ActivityRow = GObject.registerClass(
-class ActivityRow extends InfoRow {
-    _init(icons) {
-        super._init();
+class ActivityRow extends PopupMenu.PopupBaseMenuItem {
+    _init(icons, clickable, onOpen) {
+        super._init({reactive: clickable, can_focus: clickable, style_class: 'gdrive-sync-activity'});
         this._icons = icons;
-        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
         this._icon = new St.Icon({style_class: 'popup-menu-icon'});
         this._text = makeLabel('gdrive-sync-small gdrive-sync-path', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
-        this.add_child(this._time);
+        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
         this.add_child(this._icon);
         this.add_child(this._text);
+        this.add_child(this._time);
+        if (clickable)
+            this.connect('activate', () => onOpen(this._path));
+        this.connect('destroy', () => {
+            if (this._glowId)
+                GLib.Source.remove(this._glowId);
+        });
+        this.syncSensitive();
+    }
+
+    syncSensitive() {
+        if (this._activatable)
+            return super.syncSensitive();
+        this.reactive = true;
+        this.can_focus = false;
+        return true;
     }
 
     update(entry) {
-        this._time.text = GLib.DateTime.new_from_unix_local(Math.floor(entry.time)).format('%H:%M:%S');
+        this._path = entry.path;
         this._icon.gicon = this._icons.activity[entry.kind] ?? this._icons.activity.info;
         this._text.text = entry.text;
+        this._time.text = ago(entry.time);
+    }
+
+    // Grows in at the top and glows for a moment, then the glow fades out
+    reveal() {
+        const [, height] = this.get_preferred_height(-1);
+        this.set({height: 0, opacity: 0, clip_to_allocation: true});
+        this.ease({
+            height,
+            opacity: 255,
+            duration: 250,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => this.set({height: -1, clip_to_allocation: false}),
+        });
+        this.add_style_class_name('gdrive-sync-new');
+        // Runs twice: swap the glow for the fading style, then drop that once the fade is over
+        this._glowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+            if (this.has_style_class_name('gdrive-sync-new')) {
+                this.remove_style_class_name('gdrive-sync-new');
+                this.add_style_class_name('gdrive-sync-fade');
+                return GLib.SOURCE_CONTINUE;
+            }
+            this.remove_style_class_name('gdrive-sync-fade');
+            this._glowId = 0;
+            return GLib.SOURCE_REMOVE;
+        });
     }
 });
 
@@ -301,6 +350,8 @@ class Indicator extends PanelMenu.Button {
         this._status = null;
         this._reading = false;
         this._transferRows = new Map();
+        this._activityRows = new Map();
+        this._activityShown = false;
         this._folderRows = new Map();
         this._folderKey = '';
 
@@ -383,12 +434,6 @@ class Indicator extends PanelMenu.Button {
         scrolled.addMenuItem(this._activityHeader);
         this._activitySection = new PopupMenu.PopupMenuSection();
         scrolled.addMenuItem(this._activitySection);
-        this._activityRows = [];
-        for (let i = 0; i < MAX_ACTIVITY; i++) {
-            const row = new ActivityRow(this._icons);
-            this._activityRows.push(row);
-            this._activitySection.addMenuItem(row);
-        }
         this._foldersSeparator = new PopupMenu.PopupSeparatorMenuItem();
         scrolled.addMenuItem(this._foldersSeparator);
         this._foldersHeader = new SectionHeader(() => this._toggle('folders'));
@@ -554,13 +599,38 @@ class Indicator extends PanelMenu.Button {
         this._activitySeparator.visible = activity.length > 0;
         this._activityHeader.visible = activity.length > 0;
         this._activitySection.actor.visible = activity.length > 0 && this._expanded.activity;
-        this._activityRows.forEach((row, i) => {
-            row.visible = i < activity.length;
-            if (row.visible)
-                row.update(activity[i]);
-        });
+        this._renderActivity(activity, s.pid);
 
         this._renderFolders(s.folders);
+    }
+
+    // Rows follow entry ids, so a summary line that keeps counting stays put and only new entries animate in
+    _renderActivity(activity, pid) {
+        const seen = new Set();
+        activity.forEach((entry, i) => {
+            const key = `${pid}:${entry.id}`;
+            seen.add(key);
+            let row = this._activityRows.get(key);
+            const added = !row;
+            if (added) {
+                row = new ActivityRow(this._icons, Boolean(entry.path), path => {
+                    this.menu.close();
+                    openNearest(path);
+                });
+                this._activityRows.set(key, row);
+                this._activitySection.addMenuItem(row, i);
+            }
+            row.update(entry);
+            if (added && this._activityShown)
+                row.reveal();
+        });
+        for (const [key, row] of this._activityRows) {
+            if (!seen.has(key)) {
+                row.destroy();
+                this._activityRows.delete(key);
+            }
+        }
+        this._activityShown = true;
     }
 
     _renderTransfers(transfers) {

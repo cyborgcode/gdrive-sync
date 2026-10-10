@@ -31,5 +31,15 @@
 .gdrive-sync-time {
   font-size: 0.85em;
   font-feature-settings: "tnum";
-  padding-right: 6px;
+  padding-left: 8px;
+}
+
+/* New activity glows in the accent color (a plain tint before GNOME 47), then fades back */
+.gdrive-sync-activity.gdrive-sync-new {
+  background-color: rgba(128, 128, 128, 0.2);
+  background-color: st-transparentize(-st-accent-color, 0.75);
+}
+
+.gdrive-sync-activity.gdrive-sync-fade {
+  transition-duration: 600ms;
 }

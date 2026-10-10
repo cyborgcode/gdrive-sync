@@ -69,19 +69,18 @@ def base(now):
          "mode": "download", "state": "synced", "last_sync": now - 500, "error": None},
     ]
     activity = [
-        {"time": now - 1, "kind": "down", "text": "Downloaded AI/Deep Learning/lecture-04-transformers.pdf"},
-        {"time": now - 3, "kind": "down", "text": "Downloaded AI/Deep Learning/lecture-03.pdf"},
-        {"time": now - 9, "kind": "up", "text": "Uploaded Academic Year 2026-2027/Fall/MATH241/notes.odt"},
-        {"time": now - 20, "kind": "conflict", "text": "Kept the older version as logo/Icon/logo.svg.conflict1"},
-        {"time": now - 21, "kind": "delete", "text": "Deleted in Google Drive: logo/old-draft.png"},
-        {"time": now - 40, "kind": "info", "text": "AI: checking for changes…"},
-        {"time": now - 41, "kind": "info", "text": "Sync requested"},
-        {"time": now - 60, "kind": "down", "text": "Downloaded AI/a.pdf"},
-        {"time": now - 61, "kind": "down", "text": "Downloaded AI/b.pdf"},
-        {"time": now - 62, "kind": "down", "text": "Downloaded AI/c.pdf"},
-        {"time": now - 63, "kind": "down", "text": "Downloaded AI/d.pdf"},
-        {"time": now - 64, "kind": "error", "text": "logo: googleapi: Error 403: Rate limit exceeded"},
+        {"time": now - 1, "kind": "down", "text": "Downloaded 37 files to AI", "path": "/tmp/x/AI"},
+        {"time": now - 9, "kind": "up", "text": "Uploaded Academic Year 2026-2027/Fall/MATH241/notes.odt",
+         "path": "/tmp/x/Academic Year 2026-2027/Fall/MATH241/notes.odt"},
+        {"time": now - 200, "kind": "conflict", "text": "Kept the older version as logo/Icon/logo.svg.conflict1",
+         "path": "/tmp/x/logo/Icon"},
+        {"time": now - 210, "kind": "delete", "text": "Deleted in Google Drive: logo/old-draft.png", "path": "/tmp/x/logo"},
+        {"time": now - 900, "kind": "info", "text": "Now syncing \"AI\"", "path": "/tmp/x/AI"},
+        {"time": now - 3700, "kind": "error", "text": "logo: googleapi: Error 403: Rate limit exceeded", "path": None},
+        {"time": now - 7300, "kind": "info", "text": "Sync service started", "path": None},
     ]
+    for n, entry in enumerate(reversed(activity), 1):
+        entry["id"] = n
     return {"version": 1, "pid": 1, "offline_dir": "/tmp/x", "mount_dir": "/tmp/y",
             "last_sync": now - 130, "next_sync": now + 170, "folders": folders, "activity": activity,
             "mount": {"running": True, "transfers": [], "queued_uploads": 0}, "transfers": [],

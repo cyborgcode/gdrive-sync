@@ -42,6 +42,9 @@ class NamingTests(unittest.TestCase):
         self.assertTrue(gds.is_excluded("movie.mkv.part"))
         self.assertTrue(gds.is_excluded("sub/#10.mp4.282d4537.partial"))
         self.assertFalse(gds.is_excluded("report.odt"))
+        self.assertIn("'me' in owners", gds.STARRED_QUERY)
+        self.assertIn("starred = true", gds.STARRED_QUERY)
+        self.assertIn("trashed = false", gds.STARRED_QUERY)
 
 
 class ClassifyTests(unittest.TestCase):
@@ -67,26 +70,30 @@ class ClassifyTests(unittest.TestCase):
 class DescribeTests(unittest.TestCase):
     def test_transfers_and_deletes(self):
         d = gds.describe
-        self.assertEqual(d("Copied (new)", "info", "a.pdf", "*drive.Object", "F"), ("down", "Downloaded F/a.pdf", True))
+        self.assertEqual(d("Copied (new)", "info", "sub/a.pdf", "*drive.Object", "F"),
+                         ("down", "Downloaded F/sub/a.pdf", True, "F/sub/a.pdf", "Downloaded {n} files to F"))
         self.assertEqual(d("Copied (replaced existing)", "info", "a.pdf", "*local.Object", "F"),
-                         ("up", "Uploaded F/a.pdf", False))
-        self.assertEqual(d("Deleted", "info", "a.pdf", "*drive.Object", "F"),
-                         ("delete", "Deleted in Google Drive: F/a.pdf", False))
+                         ("up", "Uploaded F/a.pdf", False, "F/a.pdf", "Uploaded {n} files from F"))
+        self.assertEqual(d("Deleted", "info", "sub/a.pdf", "*drive.Object", "F"),
+                         ("delete", "Deleted in Google Drive: F/sub/a.pdf", False, "F/sub",
+                          "Deleted {n} files in Google Drive: F"))
         self.assertEqual(d("Deleted", "info", "a.pdf", "*local.Object", "F"),
-                         ("delete", "Deleted on this computer: F/a.pdf", True))
+                         ("delete", "Deleted on this computer: F/a.pdf", True, "F", "Deleted {n} files on this computer: F"))
 
-    def test_conflicts(self):
-        self.assertEqual(gds.describe("Moved (server-side) to: seed.txt.conflict1", "info", "seed.txt",
+    def test_conflicts_lead_to_their_folder(self):
+        self.assertEqual(gds.describe("Moved (server-side) to: sub/seed.txt.conflict1", "info", "sub/seed.txt",
                                       "*local.Object", "F"),
-                         ("conflict", "Kept the older version as F/seed.txt.conflict1", True))
-        kind, text, _ = gds.describe("- WARNING           New or changed in both paths                - seed.txt",
-                                     "notice", "", "", "F")
-        self.assertEqual((kind, text), ("conflict", "Changed on both sides: F/seed.txt"))
+                         ("conflict", "Kept the older version as F/sub/seed.txt.conflict1", True, "F/sub", None))
+        event = gds.describe("- WARNING           New or changed in both paths                - seed.txt",
+                             "notice", "", "", "F")
+        self.assertEqual((event.kind, event.text, event.path), ("conflict", "Changed on both sides: F/seed.txt", "F"))
 
     def test_noise_and_errors(self):
         self.assertIsNone(gds.describe("Set directory modification time (using DirSetModTime)", "info", "x", "string", "F"))
+        self.assertIsNone(gds.describe("Building Path1 and Path2 listings", "info", "", "", "F"))
+        self.assertIsNone(gds.describe("Resync is copying files from Path1 to Path2", "notice", "", "", "F"))
         self.assertIsNone(gds.describe("Bisync aborted. Please try again.", "error", "", "", "F"))
-        self.assertEqual(gds.describe("boom", "error", "", "", "F"), ("error", "F: boom", False))
+        self.assertEqual(gds.describe("boom", "error", "", "", "F"), ("error", "F: boom", False, None, None))
 
 
 class ProgressTests(unittest.TestCase):
@@ -157,6 +164,25 @@ class DaemonLogicTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_activity_folds_bursts_and_repeats(self):
+        note, root = self.daemon.note, self.daemon.cfg.folder
+        for name in ("AI/x/a.pdf", "AI/x/b.pdf", "AI/c.pdf"):
+            note("down", "Downloaded " + name, os.path.join(root, name), "Downloaded {n} files to AI")
+        note("error", "logo: boom")
+        note("error", "logo: boom")
+        note("down", "Downloaded AI/d.pdf", os.path.join(root, "AI/d.pdf"), "Downloaded {n} files to AI")
+        rows = [(a["id"], a["text"], a["path"]) for a in self.daemon.activity]
+        self.assertEqual(rows, [(3, "Downloaded AI/d.pdf", os.path.join(root, "AI/d.pdf")),
+                                (2, "logo: boom", None),
+                                (1, "Downloaded 3 files to AI", os.path.join(root, "AI"))])
+
+    def test_activity_bursts_only_fold_while_recent(self):
+        note, root = self.daemon.note, self.daemon.cfg.folder
+        note("up", "Uploaded F/a", os.path.join(root, "F/a"), "Uploaded {n} files from F")
+        self.daemon.activity[0]["time"] -= gds.GROUP_SECONDS + 1
+        note("up", "Uploaded F/b", os.path.join(root, "F/b"), "Uploaded {n} files from F")
+        self.assertEqual([a["text"] for a in self.daemon.activity], ["Uploaded F/b", "Uploaded F/a"])
 
     def test_config_and_remote_spec(self):
         self.assertEqual(self.daemon.cfg.remote_spec("ID1"), "gdrive,root_folder_id=ID1:")
