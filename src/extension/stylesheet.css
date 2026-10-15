@@ -1,20 +1,9 @@
-.gdrive-sync-label {
-  padding-left: 4px;
-  font-feature-settings: "tnum";
-}
-
-.gdrive-sync-title {
-  font-weight: bold;
-  max-width: 26em;
+.gdrive-sync-lists {
+  max-height: 24em;
 }
 
 .gdrive-sync-small {
   font-size: 0.85em;
-  max-width: 26em;
-}
-
-.gdrive-sync-path {
-  max-width: 26em;
 }
 
 .gdrive-sync-progress {

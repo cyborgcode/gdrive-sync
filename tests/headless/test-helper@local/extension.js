@@ -16,16 +16,18 @@ export default class TestHelper extends Extension {
     }
 
     _indicator() {
-        return Main.panel.statusArea['gdrive-sync@local'];
+        return Main.extensionManager.lookup('gdrive-sync@local').stateObj._indicator;
     }
 
+    // Opens Quick Settings and the Google Drive toggle's menu inside it
     OpenMenu() {
         Main.overview.hide();
+        Main.panel.statusArea.quickSettings.menu.open();
         this._indicator().menu.open();
     }
 
     CloseMenu() {
-        this._indicator().menu.close();
+        Main.panel.closeQuickSettings();
     }
 
     Click(label) {

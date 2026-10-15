@@ -10,8 +10,8 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as BarLevel from 'resource:///org/gnome/shell/ui/barLevel.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 const STATUS_FILE = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'gdrive-sync', 'status.json']);
 const CLI = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdrive-sync']);
@@ -19,6 +19,10 @@ const SECTIONS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'gdrive-
 const STALE_SECONDS = 20;
 const MAX_TRANSFERS = 5;
 const MAX_ACTIVITY = 12;
+// How long the pointer rests on a header or row before it expands
+const HOVER_DELAY = 350;
+// Grace period before a hover-opened section closes, so crossing a gap doesn't shut it
+const LEAVE_DELAY = 250;
 
 function plural(n, word) {
     return `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -108,6 +112,102 @@ function openNearest(path) {
     openPath(path);
 }
 
+// Height easing for rows and sections. While an actor has a fixed height Clutter reports that as its
+// preferred height, so clear it before measuring. Measure at the width from the last layout pass: once a
+// relayout is queued, actor.width reports the preferred width instead, which is too wide for wrapped text.
+function laidOutWidth(actor) {
+    return actor.get_allocation_box().get_width();
+}
+
+function naturalHeight(actor, forWidth) {
+    actor.remove_transition('natural-height');
+    actor.height = -1;
+    return actor.get_preferred_height(forWidth)[1];
+}
+
+// Clips the content while the height moves, then hands sizing back to the layout. Only the natural height
+// eases, with a zero minimum: an eased height is fractional, its allocation is rounded down, and the scroll
+// view shows a scrollbar whenever content's minimum height exceeds its allocation even by a fraction.
+function easeHeight(actor, from, to, duration, done = () => {}) {
+    actor.remove_transition('natural-height');
+    actor.set({min_height: 0, natural_height: from, clip_to_allocation: true});
+    actor.ease({
+        natural_height: to,
+        duration,
+        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+        onComplete: () => {
+            actor.set({height: -1, clip_to_allocation: false});
+            done();
+        },
+    });
+}
+
+// Calls onEnter once the pointer has rested on actor for HOVER_DELAY, and onLeave when it leaves or the menu
+// closes. Uses crossing events, not the hover property, so rows that can't be clicked get no hover highlight.
+// Returns a function that drops a pending onEnter.
+function onHoverIntent(actor, onEnter, onLeave = () => {}) {
+    let id = 0;
+    const cancel = () => {
+        if (id)
+            GLib.Source.remove(id);
+        id = 0;
+    };
+    actor.connect('enter-event', () => {
+        cancel();
+        id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HOVER_DELAY, () => {
+            id = 0;
+            onEnter();
+            return GLib.SOURCE_REMOVE;
+        });
+        return Clutter.EVENT_PROPAGATE;
+    });
+    actor.connect('leave-event', () => {
+        cancel();
+        onLeave();
+        return Clutter.EVENT_PROPAGATE;
+    });
+    actor.connect('notify::mapped', () => {
+        if (!actor.mapped) {
+            cancel();
+            onLeave();
+        }
+    });
+    actor.connect('destroy', cancel);
+    return cancel;
+}
+
+// A row whose label is cut off shows all of it on hover: the text wraps and the row eases taller, then
+// eases back and ellipsizes again when the pointer leaves
+function expandOnHover(row, label) {
+    const text = label.clutter_text;
+    const mode = text.ellipsize;
+    const wrap = on => {
+        text.line_wrap = on;
+        text.ellipsize = on ? Pango.EllipsizeMode.NONE : mode;
+    };
+    let full = false;
+    const show = wanted => {
+        if (wanted === full || (wanted && !text.get_layout().is_ellipsized()))
+            return;
+        full = wanted;
+        if (!row.mapped) {
+            naturalHeight(row, -1);
+            row.clip_to_allocation = false;
+            wrap(wanted);
+            return;
+        }
+        const from = row.height;
+        const width = laidOutWidth(row);
+        wrap(false);
+        const short = naturalHeight(row, width);
+        wrap(true);
+        const [, tall] = row.get_preferred_height(width);
+        // Stays wrapped while shrinking, so the clip covers the extra lines instead of them snapping away
+        easeHeight(row, from, wanted ? tall : short, 200, () => wrap(wanted));
+    };
+    onHoverIntent(row, () => show(true), () => show(false));
+}
+
 // St greys out non-reactive widgets; these rows stay reactive for full contrast but ignore clicks and focus
 const InfoRow = GObject.registerClass(
 class InfoRow extends PopupMenu.PopupBaseMenuItem {
@@ -136,7 +236,8 @@ class ActionItem extends PopupMenu.PopupImageMenuItem {
     }
 });
 
-// Clickable section title with a GNOME-style arrow; toggles its section without closing the menu
+// Clickable section title with a GNOME-style arrow; toggles its section without closing the menu,
+// and opens it when the pointer rests on it
 const SectionHeader = GObject.registerClass(
 class SectionHeader extends PopupMenu.PopupBaseMenuItem {
     _init(onToggle) {
@@ -168,27 +269,12 @@ class SectionHeader extends PopupMenu.PopupBaseMenuItem {
         this._arrow.visible = expandable;
     }
 
+    get expandable() {
+        return this._arrow.visible;
+    }
+
     activate(_event) {
         this._onToggle();
-    }
-});
-
-const HeaderRow = GObject.registerClass(
-class HeaderRow extends InfoRow {
-    _init() {
-        super._init();
-        const column = verticalBox({x_expand: true});
-        this._title = makeLabel('gdrive-sync-title');
-        this._subtitle = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
-        column.add_child(this._title);
-        column.add_child(this._subtitle);
-        this.add_child(column);
-    }
-
-    update(title, subtitle) {
-        this._title.text = title;
-        this._subtitle.text = subtitle;
-        this._subtitle.visible = subtitle !== '';
     }
 });
 
@@ -217,7 +303,7 @@ class TransferRow extends InfoRow {
         this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
         this.add_child(this._icon);
         const column = verticalBox({x_expand: true});
-        this._path = makeLabel('gdrive-sync-path', Pango.EllipsizeMode.START);
+        this._path = makeLabel(null, Pango.EllipsizeMode.START);
         this._detail = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
         this._bar = new BarLevel.BarLevel({style_class: 'slider gdrive-sync-progress', x_expand: true});
         column.add_child(this._path);
@@ -253,12 +339,14 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
     _init(icons, clickable, onOpen) {
         super._init({reactive: clickable, can_focus: clickable, style_class: 'gdrive-sync-activity'});
         this._icons = icons;
-        this._icon = new St.Icon({style_class: 'popup-menu-icon'});
-        this._text = makeLabel('gdrive-sync-small gdrive-sync-path', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
-        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
+        this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
+        this._text = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
+        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE,
+            {opacity: 160, y_align: Clutter.ActorAlign.START});
         this.add_child(this._icon);
         this.add_child(this._text);
         this.add_child(this._time);
+        expandOnHover(this, this._text);
         if (clickable)
             this.connect('activate', () => onOpen(this._path));
         this.connect('destroy', () => {
@@ -285,15 +373,9 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
 
     // Grows in at the top and glows for a moment, then the glow fades out
     reveal() {
-        const [, height] = this.get_preferred_height(-1);
-        this.set({height: 0, opacity: 0, clip_to_allocation: true});
-        this.ease({
-            height,
-            opacity: 255,
-            duration: 250,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => this.set({height: -1, clip_to_allocation: false}),
-        });
+        this.opacity = 0;
+        this.ease({opacity: 255, duration: 250, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
+        easeHeight(this, 0, naturalHeight(this, -1), 250);
         this.add_style_class_name('gdrive-sync-new');
         // Runs twice: swap the glow for the fading style, then drop that once the fade is over
         this._glowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
@@ -317,11 +399,12 @@ class FolderRow extends PopupMenu.PopupBaseMenuItem {
         this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
         this.add_child(this._icon);
         const column = verticalBox({x_expand: true});
-        this._name = makeLabel('gdrive-sync-path');
+        this._name = makeLabel(null);
         this._detail = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
         column.add_child(this._name);
         column.add_child(this._detail);
         this.add_child(column);
+        expandOnHover(this, this._name);
         this.connect('activate', () => onOpen(this._folderPath));
     }
 
@@ -342,10 +425,12 @@ class FolderRow extends PopupMenu.PopupBaseMenuItem {
     }
 });
 
-const Indicator = GObject.registerClass(
-class Indicator extends PanelMenu.Button {
+// A Quick Settings toggle whose menu holds the full status, plus a small icon among the system indicators
+// while the service runs
+const GDriveIndicator = GObject.registerClass(
+class GDriveIndicator extends QuickSettings.SystemIndicator {
     _init(extensionPath) {
-        super._init(0.5, 'Google Drive Sync');
+        super._init();
         this._cancellable = new Gio.Cancellable();
         this._status = null;
         this._reading = false;
@@ -378,14 +463,16 @@ class Indicator extends PanelMenu.Button {
                 error: warning, retiring: trash},
         };
 
-        const box = new St.BoxLayout({style_class: 'panel-status-menu-box'});
-        this._icon = new St.Icon({gicon: this._icons.panel.idle, style_class: 'system-status-icon',
-            pivot_point: new Graphene.Point({x: 0.5, y: 0.5})});
+        this._icon = this._addIndicator();
+        this._icon.set({gicon: cloud, pivot_point: new Graphene.Point({x: 0.5, y: 0.5}), visible: false});
         this._spinning = false;
-        this._label = makeLabel('gdrive-sync-label', Pango.EllipsizeMode.NONE, {visible: false});
-        box.add_child(this._icon);
-        box.add_child(this._label);
-        this.add_child(box);
+
+        // On and off also apply at the next login, like GNOME's own toggles
+        this._quickToggle = new QuickSettings.QuickMenuToggle({title: 'Google Drive', gicon: cloud});
+        this._quickToggle.connect('clicked', () => this._run(['systemctl', '--user', this._status ? 'disable' : 'enable',
+            '--now', 'gdrive-sync.service']));
+        this.quickSettingsItems.push(this._quickToggle);
+        this.menu = this._quickToggle.menu;
 
         this._expanded = loadExpanded();
         this._buildMenu();
@@ -393,6 +480,15 @@ class Indicator extends PanelMenu.Button {
             if (open) {
                 this._renderMenu();
                 this._refresh();
+                return;
+            }
+            // Hover-opened sections don't outlive the menu
+            for (const key of Object.keys(this._sections)) {
+                this._clearSectionTimer(key);
+                if (this._peek[key]) {
+                    this._peek[key] = false;
+                    this._show(key, false, false);
+                }
             }
         });
 
@@ -401,17 +497,23 @@ class Indicator extends PanelMenu.Button {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
+        this.connect('destroy', () => {
+            GLib.Source.remove(this._timeoutId);
+            for (const key of Object.keys(this._sections))
+                this._clearSectionTimer(key);
+            this._cancellable.cancel();
+        });
     }
 
     _buildMenu() {
-        this._header = new HeaderRow();
-        this.menu.addMenuItem(this._header);
+        this.menu.setHeader(this._icons.panel.idle, 'Google Drive');
         this._progressRow = new ProgressRow();
         this.menu.addMenuItem(this._progressRow);
 
-        // Panel menus only shrink to fit the screen through a scrollable part
+        // Capped in height so a long history scrolls inside the toggle menu instead of stretching Quick Settings
         const scrolled = new PopupMenu.PopupMenuSection();
         const scroll = new St.ScrollView({
+            style_class: 'gdrive-sync-lists',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             overlay_scrollbars: true,
@@ -421,9 +523,9 @@ class Indicator extends PanelMenu.Button {
             scroll.set_child(scrolled.actor);
         else
             scroll.add_actor(scrolled.actor);
-        const holder = new PopupMenu.PopupMenuSection();
-        holder.actor.add_child(scroll);
-        this.menu.addMenuItem(holder);
+        this._lists = new PopupMenu.PopupMenuSection();
+        this._lists.actor.add_child(scroll);
+        this.menu.addMenuItem(this._lists);
 
         this._transferSection = new PopupMenu.PopupMenuSection();
         scrolled.addMenuItem(this._transferSection);
@@ -440,26 +542,84 @@ class Indicator extends PanelMenu.Button {
         scrolled.addMenuItem(this._foldersHeader);
         this._foldersSection = new PopupMenu.PopupMenuSection();
         scrolled.addMenuItem(this._foldersSection);
-        this._activityHeader.setExpanded(this._expanded.activity, false);
-        this._foldersHeader.setExpanded(this._expanded.folders, false);
+        this._sections = {
+            activity: {header: this._activityHeader, section: this._activitySection},
+            folders: {header: this._foldersHeader, section: this._foldersSection},
+        };
+        this._peek = {activity: false, folders: false};
+        this._sectionTimers = {activity: 0, folders: 0};
+        for (const [key, {header, section}] of Object.entries(this._sections)) {
+            header.setExpanded(this._expanded[key], false);
+            section.actor.visible = this._expanded[key];
+            // Reactive with hover tracking so the pointer over its rows (or the gaps between them) counts
+            section.actor.set({reactive: true, track_hover: true});
+            for (const actor of [header, section.actor])
+                actor.connect('notify::hover', () => this._onSectionHover(key));
+        }
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._actionsSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._actionsSeparator);
         this._syncItem = new ActionItem('Sync now', 'view-refresh-symbolic', () => this._run([CLI, 'now']));
         this.menu.addMenuItem(this._syncItem);
-        this._startItem = new ActionItem('Start the sync service', 'media-playback-start-symbolic',
-            () => this._run(['systemctl', '--user', 'start', 'gdrive-sync.service']));
-        this.menu.addMenuItem(this._startItem);
         this._openFolder = new PopupMenu.PopupImageMenuItem('Open Google Drive folder', 'folder-symbolic');
-        this._openFolder.connect('activate', () => openPath(this._status.folder));
+        this._openFolder.connect('activate', () => {
+            Main.panel.closeQuickSettings();
+            openPath(this._status.folder);
+        });
         this.menu.addMenuItem(this._openFolder);
     }
 
+    // A click keeps a section open (remembered across menu openings); on one that hover opened, it pins it
     _toggle(key) {
-        this._expanded[key] = !this._expanded[key];
+        this._clearSectionTimer(key);
+        const open = !this._expanded[key];
+        this._expanded[key] = open;
         saveExpanded(this._expanded);
-        const header = key === 'activity' ? this._activityHeader : this._foldersHeader;
-        header.setExpanded(this._expanded[key], true);
-        this._renderMenu();
+        const wasOpen = this._peek[key] || !open;
+        this._peek[key] = false;
+        if (wasOpen !== open)
+            this._show(key, open);
+    }
+
+    // Hovering a closed section's header opens it until the pointer leaves the header and its rows
+    _onSectionHover(key) {
+        const {header, section} = this._sections[key];
+        const inside = header.hover || section.actor.hover;
+        this._clearSectionTimer(key);
+        const peek = inside
+            ? !this._expanded[key] && !this._peek[key] && header.expandable
+            : this._peek[key];
+        if (!peek)
+            return;
+        this._sectionTimers[key] = GLib.timeout_add(GLib.PRIORITY_DEFAULT, inside ? HOVER_DELAY : LEAVE_DELAY, () => {
+            this._sectionTimers[key] = 0;
+            this._peek[key] = inside;
+            this._show(key, inside);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _clearSectionTimer(key) {
+        if (this._sectionTimers[key])
+            GLib.Source.remove(this._sectionTimers[key]);
+        this._sectionTimers[key] = 0;
+    }
+
+    // Sections slide open and shut by easing their height, like GNOME's own submenus
+    _show(key, open, animate = true) {
+        const {header, section} = this._sections[key];
+        header.setExpanded(open, animate);
+        const actor = section.actor;
+        if (!animate) {
+            naturalHeight(actor, -1);
+            actor.set({clip_to_allocation: false, visible: open});
+            return;
+        }
+        const from = actor.visible ? actor.height : 0;
+        const width = laidOutWidth(actor.get_parent());
+        actor.visible = true;
+        const natural = naturalHeight(actor, width);
+        easeHeight(actor, from, open ? natural : 0, 250, () => (actor.visible = open));
     }
 
     _run(argv) {
@@ -501,25 +661,17 @@ class Indicator extends PanelMenu.Button {
 
     _render() {
         const s = this._status;
-        let icon = this._icons.panel.idle;
-        let text = '';
-        if (!s) {
-            icon = this._icons.panel.offline;
-        } else if (s.state === 'syncing') {
-            icon = this._icons.panel.syncing;
+        const icon = this._icons.panel[s?.state] ?? this._icons.panel.idle;
+        let subtitle = s?.message ?? 'Off';
+        if (s?.state === 'syncing') {
             const percent = s.progress?.percent;
-            if (percent !== null && percent !== undefined)
-                text = `${percent}%`;
-        } else if (s.state === 'offline') {
-            icon = this._icons.panel.offline;
-        } else if (s.state === 'error') {
-            icon = this._icons.panel.error;
+            subtitle = percent === null || percent === undefined ? 'Syncing…' : `Syncing ${percent}%`;
+        } else if (s?.state === 'offline') {
+            subtitle = 'Offline';
         }
-        this._icon.gicon = icon;
-        this._icon.opacity = !s || s.state === 'offline' ? 128 : 255;
+        this._icon.set({gicon: icon, visible: s !== null, opacity: s?.state === 'offline' ? 128 : 255});
         this._setSpinning(s?.state === 'syncing');
-        this._label.text = text;
-        this._label.visible = text !== '';
+        this._quickToggle.set({checked: s !== null, gicon: s ? icon : this._icons.panel.idle, subtitle});
         if (this.menu.isOpen)
             this._renderMenu();
     }
@@ -569,24 +721,20 @@ class Indicator extends PanelMenu.Button {
     _renderMenu() {
         const s = this._status;
         const running = s !== null;
+        this._actionsSeparator.visible = running;
         this._syncItem.visible = running;
-        this._startItem.visible = !running;
         this._openFolder.visible = running;
-        this._transferSection.actor.visible = running;
+        this._lists.actor.visible = running;
 
         if (!running) {
-            this._header.update("The sync service isn't running", 'Start it to keep your starred folders in sync');
+            this.menu.setHeader(this._icons.panel.idle, 'Google Drive is off',
+                'Turn it on to keep your starred folders in sync');
             this._progressRow.visible = false;
-            for (const item of [this._activitySeparator, this._activityHeader, this._foldersSeparator,
-                this._foldersHeader])
-                item.visible = false;
-            this._activitySection.actor.visible = false;
-            this._foldersSection.actor.visible = false;
             return;
         }
 
         const [title, subtitle] = this._headerText(s);
-        this._header.update(title, subtitle);
+        this.menu.setHeader(this._icons.panel[s.state] ?? this._icons.panel.idle, title, subtitle);
 
         const percent = s.progress?.percent;
         this._progressRow.visible = s.state === 'syncing' && percent !== null && percent !== undefined;
@@ -598,7 +746,6 @@ class Indicator extends PanelMenu.Button {
         const activity = s.activity.slice(0, MAX_ACTIVITY);
         this._activitySeparator.visible = activity.length > 0;
         this._activityHeader.visible = activity.length > 0;
-        this._activitySection.actor.visible = activity.length > 0 && this._expanded.activity;
         this._renderActivity(activity, s.pid);
 
         this._renderFolders(s.folders);
@@ -614,7 +761,7 @@ class Indicator extends PanelMenu.Button {
             const added = !row;
             if (added) {
                 row = new ActivityRow(this._icons, Boolean(entry.path), path => {
-                    this.menu.close();
+                    Main.panel.closeQuickSettings();
                     openNearest(path);
                 });
                 this._activityRows.set(key, row);
@@ -660,7 +807,7 @@ class Indicator extends PanelMenu.Button {
             this._folderRows.clear();
             for (const folder of folders) {
                 const row = new FolderRow(this._icons, path => {
-                    this.menu.close();
+                    Main.panel.closeQuickSettings();
                     openPath(path);
                 });
                 this._folderRows.set(folder.id, row);
@@ -674,26 +821,21 @@ class Indicator extends PanelMenu.Button {
             ? `Synced folders (${folders.length})`
             : 'Synced folders: none yet — star one of your folders in Google Drive';
         this._foldersHeader.setExpandable(folders.length > 0);
-        this._foldersSection.actor.visible = folders.length > 0 && this._expanded.folders;
         for (const folder of folders)
             this._folderRows.get(folder.id).update(folder);
     }
 
-    _onDestroy() {
-        GLib.Source.remove(this._timeoutId);
-        this._cancellable.cancel();
-        super._onDestroy();
-    }
 });
 
 export default class GDriveSyncExtension extends Extension {
     enable() {
-        this._indicator = new Indicator(this.path);
-        Main.panel.addToStatusArea(this.uuid, this._indicator);
+        this._indicator = new GDriveIndicator(this.path);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
 
     disable() {
-        this._indicator?.destroy();
+        this._indicator.quickSettingsItems.forEach(item => item.destroy());
+        this._indicator.destroy();
         this._indicator = null;
     }
 }

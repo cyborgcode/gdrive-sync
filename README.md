@@ -1,6 +1,6 @@
 # gdrive-sync
 
-Keeps your starred Google Drive folders on your Ubuntu computer, synced both ways, and usable without internet. Built on [rclone](https://rclone.org) bisync, with a GNOME Shell panel indicator.
+Keeps your starred Google Drive folders on your Ubuntu computer, synced both ways, and usable without internet. Built on [rclone](https://rclone.org) bisync, with a Google Drive toggle in GNOME's Quick Settings.
 
 ## How it works
 
@@ -14,7 +14,7 @@ Keeps your starred Google Drive folders on your Ubuntu computer, synced both way
 
 - Ubuntu (other systemd-based distros may work)
 - Python 3.8+
-- GNOME 45 or newer for the panel indicator (optional; the command line works without it)
+- GNOME 45 or newer for the Quick Settings toggle (optional; the command line works without it)
 
 ## Install
 
@@ -24,7 +24,7 @@ cd gdrive-sync
 bash src/install.sh
 ```
 
-Run it as your normal user, not with `sudo`. The installer downloads a checksum-verified rclone, signs you in to Google Drive, and starts the sync service. Log out and back in once to see the cloud icon in the top bar.
+Run it as your normal user, not with `sudo`. The installer downloads a checksum-verified rclone, signs you in to Google Drive, and starts the sync service. Log out and back in once to see the **Google Drive** toggle in Quick Settings (the Wi-Fi, sound and power menu), and a cloud icon among the system icons while syncing is on.
 
 Options: `--dir DIR` to use another folder, `--remote NAME` to use another rclone remote, `--yes` for no questions. See `--help`.
 
@@ -41,7 +41,7 @@ gdrive-sync reconnect                 # sign in to Google again
 gdrive-sync confirm-deletes FOLDER    # allow a large deletion that sync paused on
 ```
 
-The panel indicator shows the same status, live progress, and a **Sync now** button.
+The toggle turns syncing on and off (this also applies at login), and its menu shows the same status, live progress, and a **Sync now** button.
 
 To change how often it checks Drive, edit `interval_minutes` in `~/.config/gdrive-sync/config.ini`, then run `systemctl --user restart gdrive-sync`.
 
