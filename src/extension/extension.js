@@ -19,10 +19,6 @@ const SECTIONS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'gdrive-
 const STALE_SECONDS = 20;
 const MAX_TRANSFERS = 5;
 const MAX_ACTIVITY = 12;
-// How long the pointer rests on a header or row before it expands
-const HOVER_DELAY = 350;
-// Grace period before a hover-opened section closes, so crossing a gap doesn't shut it
-const LEAVE_DELAY = 250;
 // Room kept free below Quick Settings, and the least height the lists keep on a very short screen
 const SCREEN_MARGIN = 12;
 const MIN_LISTS_HEIGHT = 120;
@@ -123,19 +119,20 @@ function laidOutWidth(actor) {
 }
 
 function naturalHeight(actor, forWidth) {
-    actor.remove_transition('natural-height');
+    actor.remove_transition('height');
     actor.height = -1;
     return actor.get_preferred_height(forWidth)[1];
 }
 
-// Clips the content while the height moves, then hands sizing back to the layout. Only the natural height
-// eases, with a zero minimum: an eased height is fractional, its allocation is rounded down, and the scroll
-// view shows a scrollbar whenever content's minimum height exceeds its allocation even by a fraction.
+// Clips the content while the height moves, then hands sizing back to the layout. Every frame sets the
+// minimum height along with the height; it goes back to 0 after each one, because an eased height is
+// fractional, its allocation is rounded down, and the scroll view shows a scrollbar whenever content's
+// minimum height exceeds its allocation even by a fraction.
 function easeHeight(actor, from, to, duration, done = () => {}) {
-    actor.remove_transition('natural-height');
-    actor.set({min_height: 0, natural_height: from, clip_to_allocation: true});
+    actor.remove_transition('height');
+    actor.set({height: from, min_height: 0, clip_to_allocation: true});
     actor.ease({
-        natural_height: to,
+        height: to,
         duration,
         mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         onComplete: () => {
@@ -143,72 +140,7 @@ function easeHeight(actor, from, to, duration, done = () => {}) {
             done();
         },
     });
-}
-
-// Calls onEnter once the pointer has rested on actor for HOVER_DELAY, and onLeave when it leaves or the menu
-// closes. Uses crossing events, not the hover property, so rows that can't be clicked get no hover highlight.
-// Returns a function that drops a pending onEnter.
-function onHoverIntent(actor, onEnter, onLeave = () => {}) {
-    let id = 0;
-    const cancel = () => {
-        if (id)
-            GLib.Source.remove(id);
-        id = 0;
-    };
-    actor.connect('enter-event', () => {
-        cancel();
-        id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, HOVER_DELAY, () => {
-            id = 0;
-            onEnter();
-            return GLib.SOURCE_REMOVE;
-        });
-        return Clutter.EVENT_PROPAGATE;
-    });
-    actor.connect('leave-event', () => {
-        cancel();
-        onLeave();
-        return Clutter.EVENT_PROPAGATE;
-    });
-    actor.connect('notify::mapped', () => {
-        if (!actor.mapped) {
-            cancel();
-            onLeave();
-        }
-    });
-    actor.connect('destroy', cancel);
-    return cancel;
-}
-
-// A row whose label is cut off shows all of it on hover: the text wraps and the row eases taller, then
-// eases back and ellipsizes again when the pointer leaves
-function expandOnHover(row, label) {
-    const text = label.clutter_text;
-    const mode = text.ellipsize;
-    const wrap = on => {
-        text.line_wrap = on;
-        text.ellipsize = on ? Pango.EllipsizeMode.NONE : mode;
-    };
-    let full = false;
-    const show = wanted => {
-        if (wanted === full || (wanted && !text.get_layout().is_ellipsized()))
-            return;
-        full = wanted;
-        if (!row.mapped) {
-            naturalHeight(row, -1);
-            row.clip_to_allocation = false;
-            wrap(wanted);
-            return;
-        }
-        const from = row.height;
-        const width = laidOutWidth(row);
-        wrap(false);
-        const short = naturalHeight(row, width);
-        wrap(true);
-        const [, tall] = row.get_preferred_height(width);
-        // Stays wrapped while shrinking, so the clip covers the extra lines instead of them snapping away
-        easeHeight(row, from, wanted ? tall : short, 200, () => wrap(wanted));
-    };
-    onHoverIntent(row, () => show(true), () => show(false));
+    actor.get_transition('height')?.connect_after('new-frame', () => (actor.min_height = 0));
 }
 
 // St greys out non-reactive widgets; these rows stay reactive for full contrast but ignore clicks and focus
@@ -239,8 +171,7 @@ class ActionItem extends PopupMenu.PopupImageMenuItem {
     }
 });
 
-// Clickable section title with a GNOME-style arrow; toggles its section without closing the menu,
-// and opens it when the pointer rests on it
+// Clickable section title with a GNOME-style arrow; toggles its section without closing the menu
 const SectionHeader = GObject.registerClass(
 class SectionHeader extends PopupMenu.PopupBaseMenuItem {
     _init(onToggle) {
@@ -270,10 +201,6 @@ class SectionHeader extends PopupMenu.PopupBaseMenuItem {
 
     setExpandable(expandable) {
         this._arrow.visible = expandable;
-    }
-
-    get expandable() {
-        return this._arrow.visible;
     }
 
     activate(_event) {
@@ -342,14 +269,12 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
     _init(icons, clickable, onOpen) {
         super._init({reactive: clickable, can_focus: clickable, style_class: 'gdrive-sync-activity'});
         this._icons = icons;
-        this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
+        this._icon = new St.Icon({style_class: 'popup-menu-icon'});
         this._text = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
-        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE,
-            {opacity: 160, y_align: Clutter.ActorAlign.START});
+        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
         this.add_child(this._icon);
         this.add_child(this._text);
         this.add_child(this._time);
-        expandOnHover(this, this._text);
         if (clickable)
             this.connect('activate', () => onOpen(this._path));
         this.connect('destroy', () => {
@@ -407,7 +332,6 @@ class FolderRow extends PopupMenu.PopupBaseMenuItem {
         column.add_child(this._name);
         column.add_child(this._detail);
         this.add_child(column);
-        expandOnHover(this, this._name);
         this.connect('activate', () => onOpen(this._folderPath));
     }
 
@@ -483,15 +407,6 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             if (open) {
                 this._renderMenu();
                 this._refresh();
-                return;
-            }
-            // Hover-opened sections don't outlive the menu
-            for (const key of Object.keys(this._sections)) {
-                this._clearSectionTimer(key);
-                if (this._peek[key]) {
-                    this._peek[key] = false;
-                    this._show(key, false, false);
-                }
             }
         });
 
@@ -508,8 +423,6 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this.connect('destroy', () => {
             quickSettings.disconnect(quickSettingsOpenId);
             GLib.Source.remove(this._timeoutId);
-            for (const key of Object.keys(this._sections))
-                this._clearSectionTimer(key);
             this._cancellable.cancel();
         });
     }
@@ -557,15 +470,9 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             activity: {header: this._activityHeader, section: this._activitySection},
             folders: {header: this._foldersHeader, section: this._foldersSection},
         };
-        this._peek = {activity: false, folders: false};
-        this._sectionTimers = {activity: 0, folders: 0};
         for (const [key, {header, section}] of Object.entries(this._sections)) {
             header.setExpanded(this._expanded[key], false);
             section.actor.visible = this._expanded[key];
-            // Reactive with hover tracking so the pointer over its rows (or the gaps between them) counts
-            section.actor.set({reactive: true, track_hover: true});
-            for (const actor of [header, section.actor])
-                actor.connect('notify::hover', () => this._onSectionHover(key));
         }
 
         this._actionsSeparator = new PopupMenu.PopupSeparatorMenuItem();
@@ -580,52 +487,15 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this.menu.addMenuItem(this._openFolder);
     }
 
-    // A click keeps a section open (remembered across menu openings); on one that hover opened, it pins it
+    // A click opens or closes a section, remembered across menu openings. It slides by easing its height,
+    // like GNOME's own submenus.
     _toggle(key) {
-        this._clearSectionTimer(key);
         const open = !this._expanded[key];
         this._expanded[key] = open;
         saveExpanded(this._expanded);
-        const wasOpen = this._peek[key] || !open;
-        this._peek[key] = false;
-        if (wasOpen !== open)
-            this._show(key, open);
-    }
-
-    // Hovering a closed section's header opens it until the pointer leaves the header and its rows
-    _onSectionHover(key) {
         const {header, section} = this._sections[key];
-        const inside = header.hover || section.actor.hover;
-        this._clearSectionTimer(key);
-        const peek = inside
-            ? !this._expanded[key] && !this._peek[key] && header.expandable
-            : this._peek[key];
-        if (!peek)
-            return;
-        this._sectionTimers[key] = GLib.timeout_add(GLib.PRIORITY_DEFAULT, inside ? HOVER_DELAY : LEAVE_DELAY, () => {
-            this._sectionTimers[key] = 0;
-            this._peek[key] = inside;
-            this._show(key, inside);
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    _clearSectionTimer(key) {
-        if (this._sectionTimers[key])
-            GLib.Source.remove(this._sectionTimers[key]);
-        this._sectionTimers[key] = 0;
-    }
-
-    // Sections slide open and shut by easing their height, like GNOME's own submenus
-    _show(key, open, animate = true) {
-        const {header, section} = this._sections[key];
-        header.setExpanded(open, animate);
+        header.setExpanded(open, true);
         const actor = section.actor;
-        if (!animate) {
-            naturalHeight(actor, -1);
-            actor.set({clip_to_allocation: false, visible: open});
-            return;
-        }
         const from = actor.visible ? actor.height : 0;
         const width = laidOutWidth(actor.get_parent());
         actor.visible = true;
