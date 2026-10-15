@@ -23,6 +23,9 @@ const MAX_ACTIVITY = 12;
 const HOVER_DELAY = 350;
 // Grace period before a hover-opened section closes, so crossing a gap doesn't shut it
 const LEAVE_DELAY = 250;
+// Room kept free below Quick Settings, and the least height the lists keep on a very short screen
+const SCREEN_MARGIN = 12;
+const MIN_LISTS_HEIGHT = 120;
 
 function plural(n, word) {
     return `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -497,7 +500,13 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
+        const quickSettings = Main.panel.statusArea.quickSettings.menu;
+        const quickSettingsOpenId = quickSettings.connect('open-state-changed', (menu, open) => {
+            if (open)
+                this._fitToScreen();
+        });
         this.connect('destroy', () => {
+            quickSettings.disconnect(quickSettingsOpenId);
             GLib.Source.remove(this._timeoutId);
             for (const key of Object.keys(this._sections))
                 this._clearSectionTimer(key);
@@ -510,10 +519,10 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._progressRow = new ProgressRow();
         this.menu.addMenuItem(this._progressRow);
 
-        // Capped in height so a long history scrolls inside the toggle menu instead of stretching Quick Settings
+        // Quick Settings itself can't scroll, so the lists scroll inside it: capped at 24em by the stylesheet,
+        // and lower still by _fitToScreen when the screen has less room
         const scrolled = new PopupMenu.PopupMenuSection();
         const scroll = new St.ScrollView({
-            style_class: 'gdrive-sync-lists',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
             overlay_scrollbars: true,
@@ -523,7 +532,9 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             scroll.set_child(scrolled.actor);
         else
             scroll.add_actor(scrolled.actor);
+        this._scroll = scroll;
         this._lists = new PopupMenu.PopupMenuSection();
+        this._lists.actor.add_style_class_name('gdrive-sync-lists');
         this._lists.actor.add_child(scroll);
         this.menu.addMenuItem(this._lists);
 
@@ -749,6 +760,29 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._renderActivity(activity, s.pid);
 
         this._renderFolders(s.folders);
+        this._fitToScreen();
+    }
+
+    // Gives the lists only the height left between the top of Quick Settings and the bottom of the screen.
+    // The rest of the panel is measured as if this toggle's menu were fully open, so the result is the same
+    // whether the menu is closed, opening, or open.
+    _fitToScreen() {
+        const panel = Main.panel.statusArea.quickSettings.menu.box;
+        const monitor = Main.layoutManager.findMonitorForActor(panel) ?? Main.layoutManager.primaryMonitor;
+        const workArea = Main.layoutManager.getWorkAreaForMonitor(monitor.index);
+        const width = laidOutWidth(panel);
+        const [, panelHeight] = panel.get_preferred_height(width);
+        const container = this.menu.actor;
+        const [, shownHeight] = container.visible ? container.get_preferred_height(width) : [0, 0];
+        const [, menuHeight] = this.menu.box.get_preferred_height(width);
+        // The lists' container, as the menu counts it (it carries the 24em cap; hidden while the service is off)
+        const lists = this._lists.actor;
+        const [, listsHeight] = lists.visible ? lists.get_preferred_height(laidOutWidth(lists)) : [0, 0];
+        const rest = panelHeight - shownHeight + menuHeight - listsHeight;
+        const top = Math.max(panel.get_transformed_position()[1], workArea.y);
+        const room = workArea.y + workArea.height - top - rest - SCREEN_MARGIN;
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        this._scroll.style = `max-height: ${Math.floor(Math.max(room, MIN_LISTS_HEIGHT) / scale)}px;`;
     }
 
     // Rows follow entry ids, so a summary line that keeps counting stays put and only new entries animate in
