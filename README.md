@@ -15,6 +15,7 @@ Keeps your starred Google Drive folders on your Ubuntu computer, synced both way
 - Ubuntu (other systemd-based distros may work)
 - Python 3.8+
 - GNOME 45 or newer for the Quick Settings toggle (optional; the command line works without it)
+- [Quick Settings Scroll](https://github.com/cyborgcode/quick-settings-scroll) (optional): the toggle's lists don't scroll on their own, so when its menu gets taller than the screen, this scrolls the whole Quick Settings panel
 
 ## Install
 
