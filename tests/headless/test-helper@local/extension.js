@@ -5,6 +5,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 const IFACE = `<node><interface name="local.TestHelper">
   <method name="OpenMenu"/><method name="CloseMenu"/>
   <method name="Click"><arg type="s" direction="in" name="label"/></method>
+  <method name="ClickAttention"><arg type="s" direction="in" name="label"/></method>
   <method name="ToggleSection"><arg type="s" direction="in" name="section"/></method>
 </interface></node>`;
 
@@ -33,6 +34,12 @@ export default class TestHelper extends Extension {
     Click(label) {
         const item = this._indicator().menu._getMenuItems().find(i => i.label?.text === label);
         item.activate(null);
+    }
+
+    // Clicks the button of the first problem card that carries this label
+    ClickAttention(label) {
+        const rows = [...this._indicator()._attentionRows.values()];
+        rows.find(row => row._button.label === label)._button.emit('clicked', 0);
     }
 
     ToggleSection(section) {

@@ -82,7 +82,7 @@ def base(now):
     for n, entry in enumerate(reversed(activity), 1):
         entry["id"] = n
     return {"version": 1, "pid": 1, "offline_dir": "/tmp/x", "mount_dir": "/tmp/y",
-            "last_sync": now - 130, "next_sync": now + 170, "folders": folders, "activity": activity,
+            "last_sync": now - 130, "next_sync": now + 170, "folders": folders, "activity": activity, "folder": "/tmp/x",
             "mount": {"running": True, "transfers": [], "queued_uploads": 0}, "transfers": [],
             "current": None, "progress": None}
 
@@ -110,6 +110,9 @@ if SCENARIO == "synthetic":
                          "bytes": 2e6, "size": 17e6, "speed": 0.4e6, "eta": 37},
                         {"name": "AI/Papers/attention.pdf", "direction": "down", "percent": 88,
                          "bytes": 1.9e6, "size": 2.2e6, "speed": 0.3e6, "eta": 1}])
+    s["transfers"][1].update(direction="up", name="Academic Year 2026-2027/Fall/PHYS152 - Electromagnetism S4 - F26/"
+                                                  "Chapter 5/CH5_LectureNotes (LATEST VERSION)-20261112.zip")
+    s["activity"][5]["text"] = ("logo: Google Drive is limiting requests right now; it will be tried again")
     s["mount"]["transfers"] = [{"name": "Google Drive/philooo.pdf", "direction": "up", "percent": 35,
                                 "bytes": 160e3, "size": 455e3, "speed": 100e3, "eta": 3}]
     for i in range(4):
@@ -124,10 +127,13 @@ if SCENARIO == "synthetic":
     helper("CloseMenu")
 
     s = base(time.time())
-    s["folders"][1].update(state="error", error='Paused: more than half of the files were deleted on one side. '
-                                                'If that was intentional, run: gdrive-sync confirm-deletes "AI"')
+    s["folders"][1].update(state="error", error_kind="too_many_deletes",
+                           error='Paused: more than half of the files were deleted on one side. '
+                                 'If that was intentional, run: gdrive-sync confirm-deletes "AI"')
+    s["folders"][2].update(state="error", error_kind="error",
+                           error="Sync failed: error reading source directory: directory not found")
     s["folders"][3].update(state="synced", last_sync=time.time() - 30)
-    s.update(state="error", message="1 folder(s) need attention")
+    s.update(state="error", message="2 folders need attention")
     for i in range(3):
         put_status(s)
         time.sleep(1)
@@ -137,6 +143,39 @@ if SCENARIO == "synthetic":
     put_status(s)
     time.sleep(1.5)
     shot("6-error-menu")
+    helper("ClickAttention", "Delete on both sides")
+    time.sleep(1.5)
+    shot("7-error-confirm")
+    helper("CloseMenu")
+
+    s = base(time.time())
+    for f in s["folders"]:
+        f.update(state="error", error_kind="auth",
+                 error="Google Drive sign-in was rejected. Run: gdrive-sync reconnect")
+    s.update(state="error", message="7 folders need attention", folders=s["folders"][:3])
+    for i in range(3):
+        put_status(s)
+        time.sleep(1)
+    helper("OpenMenu")
+    time.sleep(1.5)
+    put_status(s)
+    time.sleep(1.5)
+    shot("8-sign-in-menu")
+    helper("CloseMenu")
+
+    s = base(time.time())
+    s.update(state="syncing", message="Looking for starred folders…", folders=[], activity=[])
+    for i in range(3):
+        put_status(s)
+        time.sleep(1)
+    shot("9-checking-panel")
+    s.update(state="idle", message="No starred folders yet: star one of your folders in Google Drive")
+    put_status(s)
+    helper("OpenMenu")
+    time.sleep(1.5)
+    put_status(s)
+    time.sleep(1.5)
+    shot("10-no-folders-menu")
     helper("CloseMenu")
 
 elif SCENARIO == "sections":

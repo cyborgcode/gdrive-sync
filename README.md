@@ -42,7 +42,7 @@ gdrive-sync reconnect                 # sign in to Google again
 gdrive-sync confirm-deletes FOLDER    # allow a large deletion that sync paused on
 ```
 
-The toggle turns syncing on and off (this also applies at login), and its menu shows the same status, live progress, and a **Sync now** button.
+The toggle turns syncing on and off (this also applies at login), and its menu shows the same status, live progress, and a **Sync now** button. When a folder can't sync, or Google wants you to sign in again, you get a notification, and the menu shows what happened with a button that deals with it (confirming a large deletion takes a second click).
 
 To change how often it checks Drive, edit `interval_minutes` in `~/.config/gdrive-sync/config.ini`, then run `systemctl --user restart gdrive-sync`.
 

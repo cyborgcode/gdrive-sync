@@ -213,6 +213,27 @@ def classify(errors):
     return "error"
 
 
+# What rclone adds after the error that matters: never the cause, so never what is shown
+ERROR_BOILERPLATE = (
+    "Bisync aborted", "Bisync critical error", "error during march",
+    "There were errors while building listings", "not deleting files as there were IO errors",
+    "not deleting directories as there were IO errors", "Failed to bisync", "Failed to sync",
+)
+
+
+def is_boilerplate(msg):
+    return any(text in msg for text in ERROR_BOILERPLATE)
+
+
+def main_error(errors):
+    """The first error that says what went wrong, shortened to its first line."""
+    real = [e for e in errors if e.strip() and not is_boilerplate(e)]
+    text = (real[0] if real else errors[-1] if errors else "unknown error").strip().splitlines()[0]
+    if "Quota exceeded" in text or "rateLimitExceeded" in text or "Rate Limit Exceeded" in text:
+        return "Google Drive is limiting requests right now; it will be tried again"
+    return text[:200]
+
+
 def friendly_error(kind, name, errors):
     quoted = '"%s"' % name
     if kind == "too_many_deletes":
@@ -232,8 +253,7 @@ def friendly_error(kind, name, errors):
         return "Folder not found in Google Drive (deleted, or access was removed)"
     if kind == "permission":
         return "Google Drive refused a change (no permission)"
-    last = errors[-1] if errors else "unknown error"
-    return "Sync failed: " + last[:200]
+    return "Sync failed: " + main_error(errors)
 
 
 PHASES = {
@@ -270,15 +290,19 @@ def describe(msg, level, obj, obj_type, label):
     if "New or changed in both paths" in msg:
         both = "%s/%s" % (label, msg.rsplit(" - ", 1)[-1].strip())
         return Event("conflict", "Changed on both sides: " + both, False, os.path.dirname(both), None)
-    if level == "error" and not msg.startswith(("Bisync aborted", "Bisync critical error")):
-        return Event("error", "%s: %s" % (label, msg[:240]), False, None, None)
+    if level == "error" and not is_boilerplate(msg):
+        return Event("error", "%s: %s" % (label, main_error([msg])), False, None, None)
     return None
+
+
+# How rclone names the local side: a plain path, or "local{hash}:/path" when a local flag is overridden
+LOCAL_FS = re.compile(r"/|local(\{[^}]*\})?:")
 
 
 def transfer_entry(raw, label):
     return {
         "name": "%s/%s" % (label, raw.get("name", "")),
-        "direction": "up" if str(raw.get("srcFs", "")).startswith("/") else "down",
+        "direction": "up" if LOCAL_FS.match(str(raw.get("srcFs", ""))) else "down",
         "percent": raw.get("percentage", 0),
         "bytes": raw.get("bytes", 0),
         "size": raw.get("size", 0),
@@ -393,6 +417,12 @@ class Daemon:
             top = self.activity[0] if self.activity else None
             if top and top["kind"] == kind and top["text"] == text:
                 top["time"] = now
+            elif kind == "error" and any(a["kind"] == kind and a["text"] == text for a in self.activity):
+                # An error that keeps coming back moves to the top instead of filling the list
+                self.activity = deque((a for a in self.activity if (a["kind"], a["text"]) != (kind, text)),
+                                      maxlen=self.activity.maxlen)
+                self.activity.appendleft({"id": next(self.activity_ids), "time": now, "kind": kind,
+                                          "text": text, "path": path, "group": group, "count": 1})
             elif group and top and top["group"] == group and now - top["time"] < GROUP_SECONDS:
                 top["count"] += 1
                 top.update(time=now, text=group.format(n=top["count"]),
@@ -424,7 +454,8 @@ class Daemon:
         else:
             state = "pending"
         return {"id": rec["id"], "name": rec["name"], "path": self.local_path(rec), "state": state,
-                "last_sync": rec.get("last_sync"), "error": rec.get("error")}
+                "last_sync": rec.get("last_sync"), "error": rec.get("error"),
+                "error_kind": rec.get("error_kind")}
 
     def snapshot_status(self):
         with self.lock:
@@ -693,7 +724,7 @@ class Daemon:
             rec["error_kind"] = result.kind
             rec["error"] = friendly_error(result.kind, rec["local"], result.errors)
             if result.kind != "offline":
-                self.note("error", "%s: %s" % (rec["local"], rec["error"]))
+                self.note("error", "%s: %s" % (rec["local"], rec["error"].replace("Sync failed: ", "", 1)))
         with self.lock:
             self.current = None
             self.progress = None
@@ -923,7 +954,7 @@ def cmd_status(paths):
     print("Last sync: %s" % human_time(status.get("last_sync")))
     print("\nSynced folders (in %s):" % status["folder"])
     for f in status["folders"]:
-        print("  [%s] %s%s" % (f["state"], f["name"], " — " + f["error"] if f.get("error") else ""))
+        print("  [%s] %s%s" % (f["state"], f["name"], " — " + f["error"] if f.get("error") and f["state"] == "error" else ""))
     if not status["folders"]:
         print("  none yet: star one of your folders in Google Drive")
     print("\nRecent activity:")
@@ -969,7 +1000,12 @@ def main(argv):
         return cmd_confirm_deletes(paths, argv[2])
     if command == "reconnect":
         cfg = Config(paths)
-        return subprocess.run([cfg.rclone, "config", "reconnect", cfg.remote + ":"]).returncode
+        argv = [cfg.rclone, "config", "reconnect", cfg.remote + ":"]
+        if not sys.stdin.isatty():
+            # Started from the Quick Settings button: no questions, straight to the browser
+            argv.append("--auto-confirm")
+        code = subprocess.run(argv, stdin=None if sys.stdin.isatty() else subprocess.DEVNULL).returncode
+        return code or cmd_now()
     if command in ("version", "--version"):
         print("gdrive-sync " + VERSION)
         return 0

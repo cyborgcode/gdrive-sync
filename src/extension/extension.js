@@ -18,7 +18,9 @@ const CLI = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdrive-
 const SECTIONS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'gdrive-sync', 'extension.json']);
 const STALE_SECONDS = 20;
 const MAX_TRANSFERS = 5;
-const MAX_ACTIVITY = 12;
+const MAX_ACTIVITY = 8;
+// An error that fixes itself on the next try isn't worth a notification: only tell when it has lasted this long
+const NOTIFY_AFTER_SECONDS = 600;
 
 function plural(n, word) {
     return `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -40,6 +42,90 @@ function formatDuration(seconds) {
     if (seconds < 3600)
         return `${Math.round(seconds / 60)} min`;
     return `${Math.round(seconds / 3600)} h`;
+}
+
+// Activity lines name a file by its full path; the row shows just the file, and a click opens it
+const ACTIVITY_PREFIXES = [
+    ['Uploaded ', 'Uploaded '],
+    ['Downloaded ', 'Downloaded '],
+    ['Deleted in Google Drive: ', 'Deleted from Drive: '],
+    ['Deleted on this computer: ', 'Deleted here: '],
+    ['Kept the older version as ', 'Kept the older copy as '],
+    ['Changed on both sides: ', 'Changed on both sides: '],
+    ['Renamed ', 'Renamed '],
+];
+
+function shortActivity(text) {
+    for (const [prefix, short] of ACTIVITY_PREFIXES) {
+        if (text.startsWith(prefix) && text.includes('/', prefix.length))
+            return short + text.slice(text.lastIndexOf('/') + 1);
+    }
+    return text;
+}
+
+function baseName(path) {
+    return path.slice(path.lastIndexOf('/') + 1);
+}
+
+// What needs the user: one entry per folder that can't sync, or one for a sign-in that every folder shares.
+// Each has a key (it changes when the problem does), a title, a text, and a button: its label, the command
+// it runs, and whether it deletes files and so asks for a second click.
+function findProblems(s) {
+    if (!s)
+        return [];
+    const kindOf = (kind, text) => {
+        if (kind && kind !== 'error')
+            return kind;
+        if (/gdrive-sync reconnect/.test(text))
+            return 'auth';
+        return /confirm-deletes/.test(text) ? 'too_many_deletes' : 'error';
+    };
+    const signIn = {
+        key: 'auth', title: 'Sign in to Google Drive again', urgent: true,
+        text: 'Google no longer accepts the saved sign-in, so nothing can sync.',
+        label: 'Sign in…', argv: [CLI, 'reconnect'],
+    };
+    const problems = [];
+    for (const folder of s.folders) {
+        if (!folder.error || folder.state === 'waiting' || folder.state === 'retiring')
+            continue;
+        const kind = kindOf(folder.error_kind, folder.error);
+        if (kind === 'offline')
+            continue;
+        if (kind === 'auth')
+            return [signIn];
+        const confirm = [CLI, 'confirm-deletes', baseName(folder.path)];
+        const problem = {key: `${folder.id}:${kind}:${folder.error}`, title: folder.name, urgent: true};
+        if (kind === 'too_many_deletes') {
+            Object.assign(problem, {
+                text: 'Paused: more than half of its files were deleted on one side. Nothing is deleted on ' +
+                    'the other side until you allow it.',
+                label: 'Delete on both sides', argv: confirm, destructive: true,
+            });
+        } else if (kind === 'empty_local') {
+            Object.assign(problem, {
+                text: 'Paused: the folder on this computer is empty. Put the files back, or empty it in ' +
+                    'Google Drive too (the files go to the Drive trash).',
+                label: 'Empty it in Drive too', argv: confirm, destructive: true,
+            });
+        } else if (kind === 'empty_remote') {
+            Object.assign(problem, {
+                text: 'Paused: the folder is empty in Google Drive. Nothing is removed from this computer ' +
+                    'until you allow it (the files go to the Trash).',
+                label: 'Move local files to Trash', argv: confirm, destructive: true,
+            });
+        } else {
+            Object.assign(problem, {
+                text: `${folder.error.replace(/^Sync failed: /, '').replace(/^./, c => c.toUpperCase())}` +
+                    '. It is tried again at every sync.'.replace(/^\./, folder.error.endsWith('.') ? '' : '.'),
+                label: 'Try again now', argv: [CLI, 'now'], urgent: false,
+            });
+        }
+        problems.push(problem);
+    }
+    if (!problems.length && s.state === 'error' && /gdrive-sync reconnect/.test(s.message ?? ''))
+        return [signIn];
+    return problems;
 }
 
 function ago(timestamp) {
@@ -230,7 +316,7 @@ class TransferRow extends InfoRow {
         this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
         this.add_child(this._icon);
         const column = verticalBox({x_expand: true});
-        this._path = makeLabel(null, Pango.EllipsizeMode.START);
+        this._path = makeLabel(null, Pango.EllipsizeMode.MIDDLE);
         this._detail = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
         this._bar = new BarLevel.BarLevel({style_class: 'slider gdrive-sync-progress', x_expand: true});
         column.add_child(this._path);
@@ -242,19 +328,19 @@ class TransferRow extends InfoRow {
     update(transfer) {
         const upload = transfer.direction === 'up';
         this._icon.gicon = upload ? this._icons.up : this._icons.down;
-        this._path.text = transfer.name;
-        const verb = upload ? 'Uploading' : 'Downloading';
+        this._path.text = baseName(transfer.name);
+        // The arrow already says which way it goes, so the line has room for the numbers
         const parts = [];
         if (!transfer.bytes) {
-            parts.push(`${verb} · waiting for Google Drive…`, formatBytes(transfer.size || 0));
+            parts.push(`Waiting for Google Drive… · ${formatBytes(transfer.size || 0)}`);
         } else {
-            parts.push(`${verb} ${transfer.percent}%`,
-                `${formatBytes(transfer.bytes)} of ${formatBytes(transfer.size || 0)}`);
+            parts.push(`${transfer.percent}% of ${formatBytes(transfer.size || 0)}`);
             if (transfer.speed > 0)
                 parts.push(`${formatBytes(transfer.speed)}/s`);
             if (transfer.eta)
                 parts.push(`${formatDuration(transfer.eta)} left`);
         }
+        this.accessible_name = `${upload ? 'Uploading' : 'Downloading'} ${transfer.name}`;
         this._detail.text = parts.join(' · ');
         this._bar.value = Math.min(1, (transfer.percent || 0) / 100);
     }
@@ -266,9 +352,10 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
     _init(icons, clickable, onOpen) {
         super._init({reactive: clickable, can_focus: clickable, style_class: 'gdrive-sync-activity'});
         this._icons = icons;
-        this._icon = new St.Icon({style_class: 'popup-menu-icon'});
+        this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
         this._text = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
-        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
+        this._time = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE,
+            {opacity: 160, y_align: Clutter.ActorAlign.START});
         this.add_child(this._icon);
         this.add_child(this._text);
         this.add_child(this._time);
@@ -292,8 +379,13 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
     update(entry) {
         this._path = entry.path;
         this._icon.gicon = this._icons.activity[entry.kind] ?? this._icons.activity.info;
-        this._text.text = entry.text;
+        this._text.text = shortActivity(entry.text);
+        // An error is worth reading in full; everything else is one line and a click away
+        setWrapped(this._text, entry.kind === 'error');
+        if (entry.kind !== 'error')
+            this._text.clutter_text.ellipsize = Pango.EllipsizeMode.MIDDLE;
         this._time.text = ago(entry.time);
+        this.accessible_name = `${entry.text}, ${this._time.text}`;
     }
 
     // Grows in at the top and glows for a moment, then the glow fades out
@@ -316,36 +408,87 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
     }
 });
 
+// One line per folder: what needs attention is spelled out at the top of the menu, not here
 const FolderRow = GObject.registerClass(
 class FolderRow extends PopupMenu.PopupBaseMenuItem {
     _init(icons, onOpen) {
         super._init();
         this._icons = icons;
-        this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
+        this._icon = new St.Icon({style_class: 'popup-menu-icon'});
         this.add_child(this._icon);
-        const column = verticalBox({x_expand: true});
-        this._name = makeLabel(null);
-        this._detail = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
-        column.add_child(this._name);
-        column.add_child(this._detail);
-        this.add_child(column);
+        this._name = makeLabel(null, Pango.EllipsizeMode.END, {x_expand: true});
+        this.add_child(this._name);
+        this._state = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
+        this.add_child(this._state);
         this.connect('activate', () => onOpen(this._folderPath));
     }
 
-    update(folder) {
+    update(folder, needsAttention) {
         this._folderPath = folder.path;
         this._name.text = folder.name;
-        const details = {
-            synced: `Synced ${folder.last_sync ? ago(folder.last_sync) : ''}`,
-            syncing: 'Syncing now…',
-            pending: 'Waiting for the first sync',
-            waiting: 'Waiting for an internet connection',
-            retiring: 'No longer starred: moving it to the Trash',
+        const states = {
+            synced: folder.last_sync ? ago(folder.last_sync) : 'Synced',
+            syncing: 'Syncing…',
+            pending: 'Waiting to sync',
+            waiting: 'Offline',
+            retiring: 'Removing',
+            error: 'Needs attention',
         };
-        const error = folder.state === 'error' && folder.error;
-        this._detail.text = error ? folder.error : details[folder.state] ?? '';
-        setWrapped(this._detail, Boolean(error));
-        this._icon.gicon = this._icons.folder[folder.state] ?? this._icons.folder.synced;
+        const state = needsAttention && folder.state !== 'syncing' ? 'error' : folder.state;
+        this._state.text = states[state] ?? '';
+        this._icon.gicon = this._icons.folder[state] ?? this._icons.folder.synced;
+        this.accessible_name = `${folder.name}, ${state === 'synced' ? 'synced ' : ''}${this._state.text}`;
+    }
+});
+
+// A problem and the button that deals with it. A button that deletes files asks for a second click.
+const AttentionRow = GObject.registerClass(
+class AttentionRow extends InfoRow {
+    _init(icon, onRun) {
+        super._init();
+        this._onRun = onRun;
+        this.add_style_class_name('gdrive-sync-attention');
+        this.add_child(new St.Icon({gicon: icon, style_class: 'popup-menu-icon',
+            y_align: Clutter.ActorAlign.START}));
+        const column = verticalBox({x_expand: true});
+        this._title = makeLabel(null);
+        this._text = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.NONE, {opacity: 210});
+        setWrapped(this._text, true);
+        this._button = new St.Button({style_class: 'button gdrive-sync-button', can_focus: true,
+            x_align: Clutter.ActorAlign.START});
+        this._button.connect('clicked', () => this._clicked());
+        column.add_child(this._title);
+        column.add_child(this._text);
+        column.add_child(this._button);
+        this.add_child(column);
+        this._busyUntil = 0;
+    }
+
+    update(problem) {
+        this._problem = problem;
+        this._title.text = problem.title;
+        this._text.text = problem.text;
+        const busy = Date.now() < this._busyUntil;
+        this._button.reactive = !busy;
+        if (busy)
+            this._button.label = 'Starting…';
+        else
+            this._button.label = this._armed ? 'Click again to confirm' : problem.label;
+    }
+
+    disarm() {
+        this._armed = false;
+    }
+
+    _clicked() {
+        if (this._problem.destructive && !this._armed) {
+            this._armed = true;
+        } else {
+            this._armed = false;
+            this._busyUntil = Date.now() + 4000;
+            this._onRun(this._problem.argv);
+        }
+        this.update(this._problem);
     }
 });
 
@@ -363,6 +506,8 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._activityShown = false;
         this._folderRows = new Map();
         this._folderKey = '';
+        this._attentionRows = new Map();
+        this._problemsSeen = new Map();
 
         const themed = names => Gio.ThemedIcon.new_from_names(names);
         const bundled = name => Gio.icon_new_for_string(`${extensionPath}/icons/${name}.svg`);
@@ -404,6 +549,9 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             if (open) {
                 this._renderMenu();
                 this._refresh();
+            } else {
+                // A half-given confirmation doesn't wait for the next time the menu opens
+                this._attentionRows.forEach(row => row.disarm());
             }
         });
 
@@ -422,6 +570,9 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this.menu.setHeader(this._icons.panel.idle, 'Google Drive');
         this._progressRow = new ProgressRow();
         this.menu.addMenuItem(this._progressRow);
+        // What needs the user comes first, each with the button that deals with it
+        this._attentionSection = new PopupMenu.PopupMenuSection();
+        this.menu.addMenuItem(this._attentionSection);
 
         // The lists aren't height-limited: a menu taller than the screen scrolls with the whole Quick Settings panel
         this._lists = new PopupMenu.PopupMenuSection();
@@ -442,6 +593,13 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._lists.addMenuItem(this._foldersHeader);
         this._foldersSection = new PopupMenu.PopupMenuSection();
         this._lists.addMenuItem(this._foldersSection);
+        this._foldersHint = new InfoRow();
+        const hint = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.NONE, {x_expand: true, opacity: 190});
+        hint.text = 'None yet. Star one of your own folders in Google Drive and it shows up here within a ' +
+            'few minutes.';
+        setWrapped(hint, true);
+        this._foldersHint.add_child(hint);
+        this._lists.addMenuItem(this._foldersHint);
         this._sections = {
             activity: {header: this._activityHeader, section: this._activitySection},
             folders: {header: this._foldersHeader, section: this._foldersSection},
@@ -518,19 +676,58 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
 
     _render() {
         const s = this._status;
-        const icon = this._icons.panel[s?.state] ?? this._icons.panel.idle;
-        let subtitle = s?.message ?? 'Off';
+        const problems = findProblems(s);
+        // Only real transfers show as syncing in the panel: the routine check every few minutes stays quiet
+        const transferring = s?.state === 'syncing' && (s.transfers.length > 0 || s.progress?.total_files > 0);
+        const attention = problems.length > 0 && s.state !== 'syncing';
+        let state = s?.state;
+        if (state === 'syncing' && !transferring)
+            state = attention ? 'error' : 'idle';
+        const icon = this._icons.panel[state] ?? this._icons.panel.idle;
+        let subtitle = 'Off';
         if (s?.state === 'syncing') {
             const percent = s.progress?.percent;
-            subtitle = percent === null || percent === undefined ? 'Syncing…' : `Syncing ${percent}%`;
+            if (!transferring)
+                subtitle = 'Checking…';
+            else
+                subtitle = percent === null || percent === undefined ? 'Syncing…' : `Syncing ${percent}%`;
         } else if (s?.state === 'offline') {
             subtitle = 'Offline';
+        } else if (attention || s?.state === 'error') {
+            subtitle = 'Needs attention';
+        } else if (s) {
+            subtitle = s.folders.length ? s.message : 'No folders yet';
         }
         this._icon.set({gicon: icon, visible: s !== null, opacity: s?.state === 'offline' ? 128 : 255});
-        this._setSpinning(s?.state === 'syncing');
+        this._setSpinning(transferring);
         this._quickToggle.set({checked: s !== null, gicon: s ? icon : this._icons.panel.idle, subtitle});
+        this._notify(s, problems);
         if (this.menu.isOpen)
             this._renderMenu();
+    }
+
+    // One notification per problem: at once when it waits for a decision, and only if it lasts otherwise
+    _notify(s, problems) {
+        if (!s || s.state === 'syncing')
+            return;
+        const now = Date.now() / 1000;
+        const current = new Set(problems.map(p => p.key));
+        for (const key of this._problemsSeen.keys()) {
+            if (!current.has(key))
+                this._problemsSeen.delete(key);
+        }
+        for (const problem of problems) {
+            let seen = this._problemsSeen.get(problem.key);
+            if (!seen) {
+                seen = {since: now, notified: false};
+                this._problemsSeen.set(problem.key, seen);
+            }
+            if (!seen.notified && (problem.urgent || now - seen.since > NOTIFY_AFTER_SECONDS)) {
+                seen.notified = true;
+                Main.notify(`Google Drive: ${problem.title}`,
+                    `${problem.text} Open Google Drive in Quick Settings to deal with it.`);
+            }
+        }
     }
 
     // _render runs every second, so only (re)start the endless turn when the state flips
@@ -559,8 +756,7 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             const p = s.progress;
             if (!p || !p.total_files)
                 return [title, `${c.phase || 'Working'}…${queued}`];
-            const parts = [`${p.files} of ${plural(p.total_files, 'file')}`,
-                `${formatBytes(p.bytes)} of ${formatBytes(p.total_bytes)}`];
+            const parts = [`${p.files} of ${plural(p.total_files, 'file')}`];
             if (p.speed > 0)
                 parts.push(`${formatBytes(p.speed)}/s`);
             if (p.eta)
@@ -569,10 +765,12 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         }
         if (s.state === 'syncing' || !s.last_sync)
             return [s.message, ''];
+        // The hint under "Synced folders" says how to add one; the title only has room for a few words
+        const message = s.folders.length || s.state !== 'idle' ? s.message : 'No folders yet';
         let subtitle = `Last synced ${ago(s.last_sync)}`;
         if (s.next_sync && s.next_sync > now)
             subtitle += ` · next check in ${formatDuration(s.next_sync - now)}`;
-        return [s.message, subtitle];
+        return [message, subtitle];
     }
 
     _renderMenu() {
@@ -582,6 +780,7 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._syncItem.visible = running;
         this._openFolder.visible = running;
         this._lists.actor.visible = running;
+        this._renderAttention(findProblems(s));
 
         if (!running) {
             this.menu.setHeader(this._icons.panel.idle, 'Google Drive is off',
@@ -598,6 +797,10 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         if (this._progressRow.visible)
             this._progressRow.update(percent);
 
+        const syncing = s.state === 'syncing';
+        this._syncItem.label.text = syncing ? 'Syncing…' : 'Sync now';
+        this._syncItem.setSensitive(!syncing);
+
         this._renderTransfers(s.transfers.slice(0, MAX_TRANSFERS));
 
         const activity = s.activity.slice(0, MAX_ACTIVITY);
@@ -605,7 +808,8 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._activityHeader.visible = activity.length > 0;
         this._renderActivity(activity, s.pid);
 
-        this._renderFolders(s.folders);
+        const attention = new Set(findProblems(s).map(p => p.key.split(':')[0]));
+        this._renderFolders(s.folders, attention.has('auth') ? null : attention);
     }
 
     // Rows follow entry ids, so a summary line that keeps counting stays put and only new entries animate in
@@ -637,6 +841,26 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._activityShown = true;
     }
 
+    _renderAttention(problems) {
+        const seen = new Set();
+        for (const problem of problems) {
+            seen.add(problem.key);
+            let row = this._attentionRows.get(problem.key);
+            if (!row) {
+                row = new AttentionRow(this._icons.folder.error, argv => this._run(argv));
+                this._attentionRows.set(problem.key, row);
+                this._attentionSection.addMenuItem(row);
+            }
+            row.update(problem);
+        }
+        for (const [key, row] of this._attentionRows) {
+            if (!seen.has(key)) {
+                row.destroy();
+                this._attentionRows.delete(key);
+            }
+        }
+    }
+
     _renderTransfers(transfers) {
         const seen = new Set();
         for (const transfer of transfers) {
@@ -657,7 +881,7 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         }
     }
 
-    _renderFolders(folders) {
+    _renderFolders(folders, attention) {
         const key = folders.map(f => f.id).join('\n');
         if (key !== this._folderKey) {
             this._foldersSection.removeAll();
@@ -674,12 +898,13 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         }
         this._foldersSeparator.visible = true;
         this._foldersHeader.visible = true;
-        this._foldersHeader.label.text = folders.length
-            ? `Synced folders (${folders.length})`
-            : 'Synced folders: none yet — star one of your folders in Google Drive';
+        this._foldersHeader.label.text = folders.length ? `Synced folders (${folders.length})` : 'Synced folders';
         this._foldersHeader.setExpandable(folders.length > 0);
-        for (const folder of folders)
-            this._folderRows.get(folder.id).update(folder);
+        this._foldersHint.visible = folders.length === 0;
+        for (const folder of folders) {
+            const needsAttention = attention ? attention.has(folder.id) : Boolean(folder.error);
+            this._folderRows.get(folder.id).update(folder, needsAttention);
+        }
     }
 
 });

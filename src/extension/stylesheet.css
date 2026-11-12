@@ -28,3 +28,16 @@
 .gdrive-sync-activity.gdrive-sync-fade {
   transition-duration: 600ms;
 }
+
+/* What needs the user: a tinted card at the top of the menu, with its button */
+.gdrive-sync-attention {
+  background-color: rgba(128, 128, 128, 0.15);
+  border-radius: 12px;
+  margin: 4px 0;
+}
+
+.gdrive-sync-button {
+  font-size: 0.9em;
+  margin-top: 8px;
+  padding: 4px 14px;
+}

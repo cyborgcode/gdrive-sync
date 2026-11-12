@@ -54,6 +54,30 @@ class ClassifyTests(unittest.TestCase):
         self.assertIn("boom", gds.friendly_error("error", "AI", ["boom"]))
 
 
+class ErrorTextTests(unittest.TestCase):
+    def test_the_cause_is_shown_not_what_rclone_says_after_it(self):
+        errors = ["error reading source directory: directory not found",
+                  "march: error during march: directory not found",
+                  "There were errors while building listings. Aborting as it is too dangerous to continue.",
+                  "Bisync aborted. Error is retryable without --resync due to --resilient mode."]
+        self.assertEqual(gds.friendly_error("error", "F", errors),
+                         "Sync failed: error reading source directory: directory not found")
+        self.assertIsNone(gds.describe(errors[2], "error", "", "", "F"))
+        self.assertEqual(gds.friendly_error("error", "F", errors[3:]), "Sync failed: " + errors[3])
+        self.assertEqual(gds.friendly_error("error", "F", []), "Sync failed: unknown error")
+
+    def test_quota_errors_are_one_plain_line(self):
+        quota = "Failed to copy: googleapi: Error 403: Quota exceeded for quota metric 'Queries'\nDetails:\n["
+        self.assertEqual(gds.main_error([quota]),
+                         "Google Drive is limiting requests right now; it will be tried again")
+
+    def test_uploads_are_uploads_when_rclone_names_the_local_side(self):
+        entry = gds.transfer_entry({"name": "a.pdf", "srcFs": "local{MxVuV}:/home/u/GoogleDrive/F"}, "F")
+        self.assertEqual(entry["direction"], "up")
+        self.assertEqual(gds.transfer_entry({"name": "a.pdf", "srcFs": "/home/u/F"}, "F")["direction"], "up")
+        self.assertEqual(gds.transfer_entry({"name": "a.pdf", "srcFs": "gdrive{4Nb0a}:"}, "F")["direction"], "down")
+
+
 class DescribeTests(unittest.TestCase):
     def test_transfers_and_deletes(self):
         d = gds.describe
@@ -217,6 +241,13 @@ class DaemonLogicTests(unittest.TestCase):
         self.daemon.activity[0]["time"] -= gds.GROUP_SECONDS + 1
         note("up", "Uploaded F/b", os.path.join(root, "F/b"), "Uploaded {n} files from F")
         self.assertEqual([a["text"] for a in self.daemon.activity], ["Uploaded F/b", "Uploaded F/a"])
+
+    def test_a_recurring_error_moves_to_the_top_instead_of_piling_up(self):
+        self.daemon.note("error", "F: directory not found")
+        self.daemon.note("up", "Uploaded F/a", "/x/F/a")
+        self.daemon.note("error", "F: directory not found")
+        self.assertEqual([a["text"] for a in self.daemon.activity], ["F: directory not found", "Uploaded F/a"])
+        self.assertEqual(self.daemon.activity[0]["id"], 3)
 
     def test_config_and_remote_spec(self):
         self.assertEqual(self.daemon.cfg.remote_spec("ID1"), "gdrive,root_folder_id=ID1:")
