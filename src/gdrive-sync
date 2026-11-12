@@ -127,6 +127,33 @@ def local_name(drive_name):
     return name
 
 
+CONTROL_CHARS = re.compile("[\x01-\x1f]")
+
+
+def picture_control_names(root):
+    """Rename files and folders under root whose names hold control characters (a line break
+    pasted into a folder name, say) to the visible stand-ins, like "\u240a", that a download
+    from Drive gives them. With the Ctl encoding rclone only finds the stand-ins on disk: a raw
+    control character makes it fail the whole sync with "directory not found".
+
+    Returns (old path, new path) for every rename.
+    """
+    renamed = []
+    for path, dirs, files in os.walk(root, topdown=False):
+        for name in dirs + files:
+            if not CONTROL_CHARS.search(name):
+                continue
+            source = os.path.join(path, name)
+            target = os.path.join(path, CONTROL_CHARS.sub(lambda m: chr(0x2400 + ord(m.group())), name))
+            try:
+                if not os.path.lexists(target):
+                    os.rename(source, target)
+                    renamed.append((source, target))
+            except OSError:
+                pass
+    return renamed
+
+
 def tree_signature(roots):
     """Fingerprint of what bisync would sync under roots, and how many entries it covers.
 
@@ -646,6 +673,9 @@ class Daemon:
             self.message = "Syncing \"%s\" (%d of %d)" % (rec["local"], index, count)
             self.dirty = True
         self.ensure_local(rec)
+        for _old, new in picture_control_names(self.local_path(rec)):
+            self.note("info", "Renamed %s: its name had a line break or other control character"
+                      % os.path.relpath(new, self.cfg.folder), new)
         force = rec.get("force", False)
         if force and rec.get("error_kind") in ("empty_local", "empty_remote"):
             result = self.apply_confirmed_empty(rec)

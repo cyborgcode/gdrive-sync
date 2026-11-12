@@ -105,6 +105,19 @@ class FilesystemTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_control_characters_in_names_become_visible_stand_ins(self):
+        write(os.path.join(self.root, "Week 11\nCurrent week", "a\tb.pdf"))
+        write(os.path.join(self.root, "taken\n"))
+        write(os.path.join(self.root, "taken\u240a"), "other")
+        write(os.path.join(self.root, "plain", "c.pdf"))
+        renamed = gds.picture_control_names(self.root)
+        self.assertEqual(len(renamed), 2)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "Week 11\u240aCurrent week", "a\u2409b.pdf")))
+        # never overwrites: a name that is already taken is left alone
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "taken\n")))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "plain", "c.pdf")))
+        self.assertEqual(gds.picture_control_names(self.root), [])
+
     def test_tree_signature_detects_changes(self):
         folder = os.path.join(self.root, "F")
         write(os.path.join(folder, "a.txt"), "1")
