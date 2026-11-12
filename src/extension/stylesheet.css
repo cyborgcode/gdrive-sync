@@ -3,14 +3,7 @@
 }
 
 .gdrive-sync-progress {
-  height: 6px;
-  margin-top: 4px;
-}
-
-.gdrive-sync-percent {
-  font-size: 0.85em;
-  font-feature-settings: "tnum";
-  padding-left: 8px;
+  height: 4px;
 }
 
 .gdrive-sync-time {
@@ -40,4 +33,11 @@
   font-size: 0.9em;
   margin-top: 8px;
   padding: 4px 14px;
+}
+
+/* Section titles do the separating, so they get some air above instead of a rule */
+.gdrive-sync-section {
+  font-size: 0.85em;
+  font-weight: bold;
+  padding-top: 6px;
 }

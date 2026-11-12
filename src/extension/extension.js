@@ -17,23 +17,13 @@ const STATUS_FILE = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'gdrive-s
 const CLI = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'gdrive-sync']);
 const SECTIONS_FILE = GLib.build_filenamev([GLib.get_user_config_dir(), 'gdrive-sync', 'extension.json']);
 const STALE_SECONDS = 20;
-const MAX_TRANSFERS = 5;
-const MAX_ACTIVITY = 8;
+const MAX_TRANSFERS = 3;
+const MAX_ACTIVITY = 5;
 // An error that fixes itself on the next try isn't worth a notification: only tell when it has lasted this long
 const NOTIFY_AFTER_SECONDS = 600;
 
 function plural(n, word) {
     return `${n} ${word}${n === 1 ? '' : 's'}`;
-}
-
-function formatBytes(bytes) {
-    const units = ['B', 'kB', 'MB', 'GB', 'TB'];
-    let i = 0;
-    while (bytes >= 1000 && i < units.length - 1) {
-        bytes /= 1000;
-        i++;
-    }
-    return `${bytes.toFixed(i === 0 || bytes >= 100 ? 0 : 1)} ${units[i]}`;
 }
 
 function formatDuration(seconds) {
@@ -297,52 +287,34 @@ class ProgressRow extends InfoRow {
         super._init();
         this._bar = new BarLevel.BarLevel({style_class: 'slider gdrive-sync-progress', x_expand: true,
             y_align: Clutter.ActorAlign.CENTER});
-        this._percent = makeLabel('gdrive-sync-percent');
         this.add_child(this._bar);
-        this.add_child(this._percent);
     }
 
     update(percent) {
         this._bar.value = Math.min(1, percent / 100);
-        this._percent.text = `${percent}%`;
     }
 });
 
+// One line per file on the move: which way, its name, how far along
 const TransferRow = GObject.registerClass(
 class TransferRow extends InfoRow {
     _init(icons) {
         super._init();
         this._icons = icons;
-        this._icon = new St.Icon({style_class: 'popup-menu-icon', y_align: Clutter.ActorAlign.START});
+        this._icon = new St.Icon({style_class: 'popup-menu-icon'});
         this.add_child(this._icon);
-        const column = verticalBox({x_expand: true});
-        this._path = makeLabel(null, Pango.EllipsizeMode.MIDDLE);
-        this._detail = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {opacity: 190});
-        this._bar = new BarLevel.BarLevel({style_class: 'slider gdrive-sync-progress', x_expand: true});
-        column.add_child(this._path);
-        column.add_child(this._detail);
-        column.add_child(this._bar);
-        this.add_child(column);
+        this._name = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.MIDDLE, {x_expand: true});
+        this.add_child(this._name);
+        this._percent = makeLabel('gdrive-sync-time', Pango.EllipsizeMode.NONE, {opacity: 160});
+        this.add_child(this._percent);
     }
 
     update(transfer) {
         const upload = transfer.direction === 'up';
         this._icon.gicon = upload ? this._icons.up : this._icons.down;
-        this._path.text = baseName(transfer.name);
-        // The arrow already says which way it goes, so the line has room for the numbers
-        const parts = [];
-        if (!transfer.bytes) {
-            parts.push(`Waiting for Google Drive… · ${formatBytes(transfer.size || 0)}`);
-        } else {
-            parts.push(`${transfer.percent}% of ${formatBytes(transfer.size || 0)}`);
-            if (transfer.speed > 0)
-                parts.push(`${formatBytes(transfer.speed)}/s`);
-            if (transfer.eta)
-                parts.push(`${formatDuration(transfer.eta)} left`);
-        }
-        this.accessible_name = `${upload ? 'Uploading' : 'Downloading'} ${transfer.name}`;
-        this._detail.text = parts.join(' · ');
-        this._bar.value = Math.min(1, (transfer.percent || 0) / 100);
+        this._name.text = baseName(transfer.name);
+        this._percent.text = transfer.bytes ? `${transfer.percent}%` : 'Waiting';
+        this.accessible_name = `${upload ? 'Uploading' : 'Downloading'} ${transfer.name}, ${this._percent.text}`;
     }
 });
 
@@ -384,7 +356,7 @@ class ActivityRow extends PopupMenu.PopupBaseMenuItem {
         setWrapped(this._text, entry.kind === 'error');
         if (entry.kind !== 'error')
             this._text.clutter_text.ellipsize = Pango.EllipsizeMode.MIDDLE;
-        this._time.text = ago(entry.time);
+        this._time.text = ago(entry.time).replace(' ago', '');
         this.accessible_name = `${entry.text}, ${this._time.text}`;
     }
 
@@ -427,7 +399,7 @@ class FolderRow extends PopupMenu.PopupBaseMenuItem {
         this._folderPath = folder.path;
         this._name.text = folder.name;
         const states = {
-            synced: folder.last_sync ? ago(folder.last_sync) : 'Synced',
+            synced: '',
             syncing: 'Syncing…',
             pending: 'Waiting to sync',
             waiting: 'Offline',
@@ -437,7 +409,7 @@ class FolderRow extends PopupMenu.PopupBaseMenuItem {
         const state = needsAttention && folder.state !== 'syncing' ? 'error' : folder.state;
         this._state.text = states[state] ?? '';
         this._icon.gicon = this._icons.folder[state] ?? this._icons.folder.synced;
-        this.accessible_name = `${folder.name}, ${state === 'synced' ? 'synced ' : ''}${this._state.text}`;
+        this.accessible_name = `${folder.name}, ${this._state.text || 'synced'}`;
     }
 });
 
@@ -580,15 +552,15 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
 
         this._transferSection = new PopupMenu.PopupMenuSection();
         this._lists.addMenuItem(this._transferSection);
-        this._activitySeparator = new PopupMenu.PopupSeparatorMenuItem();
-        this._lists.addMenuItem(this._activitySeparator);
+        this._moreTransfers = new InfoRow();
+        this._moreLabel = makeLabel('gdrive-sync-small', Pango.EllipsizeMode.END, {x_expand: true, opacity: 160});
+        this._moreTransfers.add_child(this._moreLabel);
+        this._lists.addMenuItem(this._moreTransfers);
         this._activityHeader = new SectionHeader(() => this._toggle('activity'));
         this._activityHeader.label.text = 'Activity';
         this._lists.addMenuItem(this._activityHeader);
         this._activitySection = new PopupMenu.PopupMenuSection();
         this._lists.addMenuItem(this._activitySection);
-        this._foldersSeparator = new PopupMenu.PopupSeparatorMenuItem();
-        this._lists.addMenuItem(this._foldersSeparator);
         this._foldersHeader = new SectionHeader(() => this._toggle('folders'));
         this._lists.addMenuItem(this._foldersHeader);
         this._foldersSection = new PopupMenu.PopupMenuSection();
@@ -748,7 +720,6 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
     }
 
     _headerText(s) {
-        const now = Date.now() / 1000;
         if (s.state === 'syncing' && s.current) {
             const c = s.current;
             const title = c.count > 1 ? `Syncing ${c.folder} (${c.index} of ${c.count})` : `Syncing ${c.folder}`;
@@ -757,8 +728,8 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             if (!p || !p.total_files)
                 return [title, `${c.phase || 'Working'}…${queued}`];
             const parts = [`${p.files} of ${plural(p.total_files, 'file')}`];
-            if (p.speed > 0)
-                parts.push(`${formatBytes(p.speed)}/s`);
+            if (p.percent !== null && p.percent !== undefined)
+                parts.unshift(`${p.percent}%`);
             if (p.eta)
                 parts.push(`${formatDuration(p.eta)} left`);
             return [title, parts.join(' · ') + queued];
@@ -767,10 +738,7 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             return [s.message, ''];
         // The hint under "Synced folders" says how to add one; the title only has room for a few words
         const message = s.folders.length || s.state !== 'idle' ? s.message : 'No folders yet';
-        let subtitle = `Last synced ${ago(s.last_sync)}`;
-        if (s.next_sync && s.next_sync > now)
-            subtitle += ` · next check in ${formatDuration(s.next_sync - now)}`;
-        return [message, subtitle];
+        return [message, `Synced ${ago(s.last_sync)}`];
     }
 
     _renderMenu() {
@@ -802,9 +770,10 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
         this._syncItem.setSensitive(!syncing);
 
         this._renderTransfers(s.transfers.slice(0, MAX_TRANSFERS));
+        this._moreTransfers.visible = s.transfers.length > MAX_TRANSFERS;
+        this._moreLabel.text = `and ${s.transfers.length - MAX_TRANSFERS} more`;
 
         const activity = s.activity.slice(0, MAX_ACTIVITY);
-        this._activitySeparator.visible = activity.length > 0;
         this._activityHeader.visible = activity.length > 0;
         this._renderActivity(activity, s.pid);
 
@@ -896,7 +865,6 @@ class GDriveIndicator extends QuickSettings.SystemIndicator {
             }
             this._folderKey = key;
         }
-        this._foldersSeparator.visible = true;
         this._foldersHeader.visible = true;
         this._foldersHeader.label.text = folders.length ? `Synced folders (${folders.length})` : 'Synced folders';
         this._foldersHeader.setExpandable(folders.length > 0);
